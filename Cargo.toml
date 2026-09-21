@@ -33,6 +33,13 @@ required-features = ["oci"]
 test = false
 doc = false
 
+[[bin]]
+name = "oci_seed"
+path = "tests/support/oci_seed.rs"
+required-features = ["oci"]
+test = false
+doc = false
+
 [dependencies]
 axum = { version = "0.8", features = ["json", "tokio", "http1", "http2"] }
 blake3 = "1"
