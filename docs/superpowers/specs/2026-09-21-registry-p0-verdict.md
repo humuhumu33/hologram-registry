@@ -1,8 +1,8 @@
 # Hologram Registry v1, P0 verdict
 
 Date: 2026-09-21. Branch: `registry/p0-spike` @ `a3b5e4c` on `humuhumu33/hologram-registry`.
-CI runs: [35593011870](https://github.com/humuhumu33/hologram-registry/actions/runs/35593011870) (first),
-[35594124604](https://github.com/humuhumu33/hologram-registry/actions/runs/35594124604) (with the Windows workaround).
+CI runs: [35593011870](https://github.com/humuhumu33/hologram-registry/actions/runs/35593011870) (first: Linux and macOS green, Windows red),
+[35594124604](https://github.com/humuhumu33/hologram-registry/actions/runs/35594124604) (with the Windows workaround: all four jobs green).
 
 Marks: **[CI]** read from a CI log. **[local]** run on Ilya's Windows 11 machine. **[read]** read in the Kappa source, not run. **[estimate]**.
 
@@ -13,7 +13,7 @@ memory, and behave as the plan assumed in every test. **Condition:** Kappa's enc
 the registry build. This repository keeps `aws-lc` out on purpose, and it broke the clean Windows build. One small
 upstream patch removes it. Registry code does not merge into the parent until that patch is carried.
 
-Decision 1 is Ilya's. P1 does not start without his recorded go.
+**Decision 1: GO, recorded by Ilya on 2026-09-21** ("proceed", in reply to this verdict). P1 may start on fork branches. The condition above still gates every merge into the parent.
 
 ## 1. How the crates are pinned
 
@@ -61,7 +61,7 @@ for 512 frames of 4 MiB the answer to "does it grow with size" is no. SC-007 all
 |---|---|---|
 | Linux **[CI]** | 7.1 s (about 290 MB/s, including generating and hashing the bytes) | 2.0 s |
 | macOS **[CI]** | 13.4 s | 2.2 s |
-| Windows **[CI]** | see section 6 | |
+| Windows **[CI]** | 13.8 s | 1.9 s |
 
 `upload_complete` re-reads the staged file once to hash it, as the plan said: about 1 GB/s on Linux.
 The per-part cost the plan feared (a file open, MD5 and two CRCs per call) does not hurt at 4 MiB frames. Patch
@@ -80,7 +80,7 @@ P8 needs no lock file of its own.
 |---|---|---|---|---|
 | Linux x86_64 gnu **[CI]** | yes | 7 of 7 | pass | pin gate passes in spike mode |
 | macOS aarch64 **[CI]** | yes | 7 of 7 | pass | |
-| Windows x86_64 MSVC **[CI + local]** | yes, **only with the NASM workaround** on a clean runner | 7 of 7 (CI and local) | running when this was written; see the run | no path, `:`-in-file-name, rename or lock problem appeared |
+| Windows x86_64 MSVC **[CI + local]** | yes, **only with the NASM workaround** on a clean runner | 7 of 7 (CI and local) | pass | no path, `:`-in-file-name, rename or lock problem appeared |
 | Linux x86_64 musl **[CI, informational]** | yes | not run | not run | feeds decision 6: a static image is possible |
 
 Systems v1 commits to: **Linux x86_64 and aarch64, macOS aarch64, Windows x86_64.** Windows is unconditional once
