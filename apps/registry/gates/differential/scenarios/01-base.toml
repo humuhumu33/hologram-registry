@@ -1,0 +1,28 @@
+name = "01-base"
+summary = "The base route, in every form a client or a probe sends."
+repo = "gate-b/base"
+
+[[step]]
+id = "get"
+method = "GET"
+path = "/v2/"
+
+[[step]]
+id = "no-slash"
+method = "GET"
+path = "/v2"
+
+[[step]]
+id = "head"
+method = "HEAD"
+path = "/v2/"
+
+[[step]]
+id = "options"
+method = "OPTIONS"
+path = "/v2/"
+
+[[step]]
+id = "post"
+method = "POST"
+path = "/v2/"

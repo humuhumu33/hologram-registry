@@ -102,3 +102,53 @@ jobs:
           name: gate-a-report
           path: ${{ runner.temp }}/report
           if-no-files-found: warn
+
+  gate-b:
+    name: Gate B · same session, reference and us
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      GATE: apps/registry/gates/differential
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gates
+          workspaces: |
+            .
+            apps/registry/gates/differential
+      - name: The gate's own tests (normalise, compare, allowlist)
+        run: cargo test --locked --manifest-path "$GATE/Cargo.toml"
+      - name: Build the gate and the server
+        run: |
+          cargo build --locked --manifest-path "$GATE/Cargo.toml"
+          cargo build --locked --features oci --bin hologram
+      - name: The reference compared with itself shows nothing (blocking)
+        # If this is red the normaliser is wrong, or a scenario is: never the product.
+        run: |
+          "$GATE/target/debug/differential" run --left reference --right reference | tee "$RUNNER_TEMP/gate-b-self.md"
+      - name: Record the reference's transcripts
+        if: always()
+        run: |
+          "$GATE/target/debug/differential" record --target reference --out "$RUNNER_TEMP/golden"
+      - name: The reference compared with Hologram Registry (reported, not blocking yet)
+        # Blocks from the day the list of unlisted differences is empty (plan, P9).
+        continue-on-error: true
+        run: |
+          "$GATE/target/debug/differential" run --left reference --right "binary:$PWD/target/debug/hologram"             --allowlist apps/registry/DIFFERENCES.md --report "$RUNNER_TEMP/gate-b.md"
+      - name: Verdict
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/gate-b-self.md" "$RUNNER_TEMP/gate-b.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gate-b
+          path: |
+            ${{ runner.temp }}/golden
+            ${{ runner.temp }}/gate-b.md
+            ${{ runner.temp }}/gate-b-self.md
+          if-no-files-found: warn
