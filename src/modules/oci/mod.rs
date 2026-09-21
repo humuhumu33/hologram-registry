@@ -55,10 +55,16 @@ pub struct Registry {
 
 /// The reference's settings that change what a route answers. P5 reads them
 /// from `config.yml` too; the environment names are the reference's own.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     /// `storage.delete.enabled`. Off by default, as in the reference.
     pub delete_enabled: bool,
+    /// `http.headers`: added to every answer under `/v2/`, errors and
+    /// preflights included. It is the reference's recipe for CORS, which a web
+    /// UI on another origin needs (FR-R31): `Access-Control-Allow-Origin`,
+    /// `-Methods`, `-Headers`, and `-Expose-Headers` naming
+    /// `Docker-Content-Digest` and `Link`. P5 fills it from `config.yml`.
+    pub headers: Vec<(axum::http::HeaderName, HeaderValue)>,
 }
 
 impl Settings {
@@ -68,6 +74,7 @@ impl Settings {
         };
         Self {
             delete_enabled: on("REGISTRY_STORAGE_DELETE_ENABLED"),
+            headers: Vec::new(),
         }
     }
 }
@@ -130,7 +137,7 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
             static SETTINGS: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
             let registry = Registry {
                 store: store.clone(),
-                settings: *SETTINGS.get_or_init(Settings::from_environment),
+                settings: SETTINGS.get_or_init(Settings::from_environment).clone(),
             };
             handle(registry, request).await
         }
@@ -146,6 +153,7 @@ pub async fn handle(registry: Registry, request: Request) -> Response {
     // live across an await: the head is borrowed, the body is moved.
     let (head, body) = request.into_parts();
     let origin = origin(&head.headers);
+    let configured = registry.settings.headers.clone();
     let rest = head.uri.path().strip_prefix("/v2/").unwrap_or_default();
     let route = path::decode(rest)
         .ok_or_else(OciError::unknown_route)
@@ -157,6 +165,12 @@ pub async fn handle(registry: Registry, request: Request) -> Response {
         Err(error) => error.into_response(),
     };
     absolute_location(&mut response, origin.as_deref());
+    // Last, so they are on errors and on `OPTIONS` too. A browser's preflight
+    // carries no credentials: when login lands (P6) `OPTIONS` stays in front
+    // of it, or no web UI on another origin can reach the registry.
+    for (name, value) in configured {
+        response.headers_mut().append(name, value);
+    }
     response
 }
 

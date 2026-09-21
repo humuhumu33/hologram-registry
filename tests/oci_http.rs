@@ -72,6 +72,8 @@ struct Volume {
     store: Arc<OciStore>,
     /// `storage.delete.enabled`. Off, as in the reference, unless a test turns it on.
     delete_enabled: bool,
+    /// `http.headers`.
+    headers: Vec<(&'static str, &'static str)>,
 }
 
 fn volume() -> Volume {
@@ -81,6 +83,7 @@ fn volume() -> Volume {
         _dir: dir,
         store,
         delete_enabled: false,
+        headers: Vec::new(),
     }
 }
 
@@ -111,6 +114,16 @@ async fn send_body(
         store: volume.store.clone(),
         settings: Settings {
             delete_enabled: volume.delete_enabled,
+            headers: volume
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        axum::http::HeaderName::from_static(name),
+                        axum::http::HeaderValue::from_static(value),
+                    )
+                })
+                .collect(),
         },
     };
     handle(registry, request.body(Body::from(body)).expect("request")).await
@@ -695,6 +708,52 @@ async fn a_manifest_with_a_subject_says_so_and_one_over_the_cap_is_413() {
     .await;
     assert_eq!(huge.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(error_code(huge).await, "MANIFEST_INVALID");
+}
+
+/// FR-R31: with the reference's `http.headers` recipe, a web UI on another
+/// origin can preflight, list, and read the headers it needs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browser_on_another_origin_can_preflight_and_list() {
+    let mut volume = volume();
+    volume.headers = vec![
+        ("access-control-allow-origin", "https://ui.example"),
+        ("access-control-allow-methods", "HEAD, GET, OPTIONS, DELETE"),
+        ("access-control-allow-headers", "Authorization, Accept"),
+        (
+            "access-control-expose-headers",
+            "Docker-Content-Digest, Link",
+        ),
+    ];
+    seed(&volume.store);
+    let preflight = send(
+        &volume,
+        "OPTIONS",
+        "/v2/team/app/manifests/v1",
+        &[
+            ("origin", "https://ui.example"),
+            ("access-control-request-method", "DELETE"),
+        ],
+    )
+    .await;
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        header(&preflight, "access-control-allow-origin"),
+        "https://ui.example"
+    );
+    assert!(header(&preflight, "access-control-allow-methods").contains("DELETE"));
+
+    let listed = send(&volume, "GET", "/v2/team/app/tags/list?n=1", &[]).await;
+    assert_eq!(
+        header(&listed, "access-control-expose-headers"),
+        "Docker-Content-Digest, Link"
+    );
+    // On an error too: a UI must be able to read why it was refused.
+    let refused = send(&volume, "GET", "/v2/team/app/manifests/nope", &[]).await;
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        header(&refused, "access-control-allow-origin"),
+        "https://ui.example"
+    );
 }
 
 // ---- Discovery and management ------------------------------------------------
