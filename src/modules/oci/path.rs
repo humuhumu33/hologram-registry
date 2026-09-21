@@ -231,8 +231,11 @@ fn pick(
     route(method).ok_or_else(|| OciError::wrong_method(allow))
 }
 
+/// A name outside the grammar is no route at all: the reference's router has
+/// the grammar in its patterns, so such a path matches nothing and is the
+/// plain 404 (gate B, `names`: `Foo`, `a..b`, `-a`, `_catalog`).
 fn repo(name: &str) -> Result<RepoName, OciError> {
-    RepoName::parse(name).map_err(|error| OciError::from_store(error, Context::Blob))
+    RepoName::parse(name).map_err(|_| OciError::unknown_route())
 }
 
 fn digest(value: &str) -> Result<Digest, OciError> {
@@ -308,16 +311,12 @@ mod tests {
                 repo: name("blobs/uploads")
             }
         );
-        assert_eq!(
-            get("Foo/manifests/latest").expect_err("row 7").code(),
-            Some(ErrorCode::NameInvalid)
-        );
+        let row_7 = get("Foo/manifests/latest").expect_err("row 7");
+        assert_eq!((row_7.code(), row_7.status()), (None, StatusCode::NOT_FOUND));
         let row_8 = get("foo/manifests/a/b").expect_err("row 8");
         assert_eq!((row_8.code(), row_8.status()), (None, StatusCode::NOT_FOUND));
-        assert_eq!(
-            get("_catalog/manifests/x").expect_err("row 9").code(),
-            Some(ErrorCode::NameInvalid)
-        );
+        let row_9 = get("_catalog/manifests/x").expect_err("row 9");
+        assert_eq!((row_9.code(), row_9.status()), (None, StatusCode::NOT_FOUND));
     }
 
     #[test]
@@ -326,11 +325,8 @@ mod tests {
             assert!(get(&format!("{good}/tags/list")).is_ok(), "{good}");
         }
         for bad in ["a___b", "a..b", "-a", "a-", "a//b"] {
-            assert_eq!(
-                get(&format!("{bad}/tags/list")).expect_err(bad).code(),
-                Some(ErrorCode::NameInvalid),
-                "{bad}"
-            );
+            let error = get(&format!("{bad}/tags/list")).expect_err(bad);
+            assert_eq!((error.code(), error.status()), (None, StatusCode::NOT_FOUND), "{bad}");
         }
     }
 

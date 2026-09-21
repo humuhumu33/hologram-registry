@@ -327,7 +327,9 @@ impl IntoResponse for OciError {
                 if !detail.is_null() {
                     entry["detail"] = detail;
                 }
-                let body = json!({ "errors": [entry] }).to_string();
+                // The reference's encoder ends the body with a newline; clients
+                // see it in Content-Length (gate B, every error).
+                let body = json!({ "errors": [entry] }).to_string() + "\n";
                 let mut response = (status, body).into_response();
                 response
                     .headers_mut()
