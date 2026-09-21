@@ -28,6 +28,8 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8", features = ["json", "tokio", "http1", "http2"] }
 blake3 = "1"
+kappa-core = { git = "https://github.com/UOR-Foundation/kappa-registry", rev = "2af86560a177fc9651b6c0e92e7974140ed77dd5", optional = true }
+kappa-store-redb = { git = "https://github.com/UOR-Foundation/kappa-registry", rev = "2af86560a177fc9651b6c0e92e7974140ed77dd5", optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 fs4 = "1.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -83,6 +85,11 @@ hologram-client = { path = "crates/hologram-client" }
 
 [features]
 bdd = []
+oci = ["dep:kappa-core", "dep:kappa-store-redb"]
+
+[[test]]
+name = "oci_spike"
+required-features = ["oci"]
 
 [[test]]
 name = "bdd"

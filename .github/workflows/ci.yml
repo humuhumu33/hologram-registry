@@ -25,3 +25,57 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --release --locked --package hologram-live --bin hologram
       - run: ./scripts/smoke.sh ./target/release/hologram
+
+  # P0 spike only: can the Kappa store crates live inside this binary on three
+  # systems? Runs on registry/p0-* branches; removed again when P1 lands.
+  registry-spike:
+    if: startsWith(github.ref, 'refs/heads/registry/p0-')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: registry-spike-${{ matrix.os }}
+      - name: Build with the Kappa crates
+        run: cargo build --locked --features oci
+      - name: Store round trip
+        run: cargo test --locked --features oci --test oci_spike -- --nocapture --test-threads=1
+      - name: 2 GiB stream, release
+        run: cargo test --release --locked --features oci --test oci_spike -- --ignored --nocapture q8
+      - name: Peak memory at 2 GiB (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bin=$(ls -t target/release/deps/oci_spike-* | grep -v '\.d$' | head -1)
+          /usr/bin/time -v "$bin" --ignored --nocapture q8 2>&1 | grep -E "VERDICT|Maximum resident|Elapsed"
+      - name: New native code
+        shell: bash
+        run: cargo tree --locked --features oci -e normal --prefix none | sort -u | grep -E -- "-sys " || true
+      - name: Pin gate (spike allowances on)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: KAPPA_PIN_ALLOW_UNOPENED=1 KAPPA_PIN_ALLOW_AWS_LC=1 ./scripts/check-kappa-pin.sh
+      - name: Release binary size with the feature
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo build --release --locked --package hologram-live --bin hologram
+          ls -l target/release/hologram | awk '{print "SIZE default", $5}'
+          cargo build --release --locked --features oci --package hologram-live --bin hologram
+          ls -l target/release/hologram | awk '{print "SIZE oci", $5}'
+      - name: musl builds (Linux only, informational)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo build --locked --features oci --target x86_64-unknown-linux-musl
