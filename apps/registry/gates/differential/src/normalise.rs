@@ -72,7 +72,23 @@ pub struct Transcript {
     pub exchanges: Vec<Exchange>,
 }
 
-pub fn normalise(raw: RawExchange, base: &str) -> Exchange {
+pub fn normalise(mut raw: RawExchange, base: &str) -> Exchange {
+    // A multipart answer invents a boundary per response. Its value is not
+    // behaviour; that the answer is multipart, and what the parts hold, is.
+    let boundary = raw
+        .headers
+        .get("content-type")
+        .and_then(|value| value.split("boundary=").nth(1))
+        .map(|rest| rest.trim_matches('"').to_owned())
+        .filter(|boundary| !boundary.is_empty());
+    if let Some(boundary) = boundary {
+        raw.body = replace_bytes(&raw.body, boundary.as_bytes(), b"<boundary>");
+        if let Some(value) = raw.headers.get_mut("content-type") {
+            *value = value.replace(&boundary, "<boundary>");
+        }
+        // The marker is shorter than the boundary it replaced.
+        raw.headers.remove("content-length");
+    }
     let mut headers: BTreeMap<String, String> = raw
         .headers
         .into_iter()
@@ -85,6 +101,21 @@ pub fn normalise(raw: RawExchange, base: &str) -> Exchange {
         headers.remove("content-length");
     }
     Exchange { id: raw.id, method: raw.method, target: raw.target, status: raw.status, headers, body }
+}
+
+fn replace_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut at = 0;
+    while at < haystack.len() {
+        if haystack[at..].starts_with(needle) {
+            out.extend_from_slice(with);
+            at += needle.len();
+        } else {
+            out.push(haystack[at]);
+            at += 1;
+        }
+    }
+    out
 }
 
 /// The body, and whether scrubbing changed it.
@@ -258,6 +289,17 @@ mod tests {
         assert!(matches!(normalise(raw(200, &[], &big), "x").body, Body::Bytes { len, .. } if len == INLINE_BODY + 1));
         assert!(matches!(normalise(raw(200, &[], &[0xff, 0xfe]), "x").body, Body::Bytes { len: 2, .. }));
         assert_eq!(normalise(raw(200, &[], b"404 page not found\n"), "x").body, Body::Text("404 page not found\n".to_owned()));
+    }
+
+    #[test]
+    fn a_multipart_boundary_is_not_behaviour() {
+        let answer = |boundary: &str| {
+            let body = format!("--{boundary}\r\nContent-Range: bytes 0-0/9\r\n\r\nA\r\n--{boundary}--\r\n");
+            normalise(raw(206, &[("content-type", &format!("multipart/byteranges; boundary={boundary}")), ("content-length", "99")], body.as_bytes()), "x")
+        };
+        let (one, two) = (answer("8666096a738fc901f6c4"), answer("ca05ca6e31667c5c7a2b"));
+        assert_eq!(one, two);
+        assert_eq!(header(&one, "content-type"), Some("multipart/byteranges; boundary=<boundary>"));
     }
 
     #[test]

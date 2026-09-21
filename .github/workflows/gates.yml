@@ -129,6 +129,7 @@ jobs:
       - name: The reference compared with itself shows nothing (blocking)
         # If this is red the normaliser is wrong, or a scenario is: never the product.
         run: |
+          set -o pipefail
           "$GATE/target/debug/differential" run --left reference --right reference | tee "$RUNNER_TEMP/gate-b-self.md"
       - name: Record the reference's transcripts
         if: always()

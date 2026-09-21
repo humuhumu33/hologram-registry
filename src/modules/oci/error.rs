@@ -283,6 +283,11 @@ impl IntoResponse for OciError {
                     CONTENT_TYPE,
                     HeaderValue::from_static("text/plain; charset=utf-8"),
                 );
+                // As the reference's router sends it (gate B, `unknown-route`).
+                response.headers_mut().insert(
+                    axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                    HeaderValue::from_static("nosniff"),
+                );
                 response
             }
             Some(code) => {

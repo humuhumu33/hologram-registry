@@ -144,15 +144,45 @@ pub async fn handle(registry: Registry, request: Request) -> Response {
     // The body is not `Sync`, so nothing borrowed from the whole request may
     // live across an await: the head is borrowed, the body is moved.
     let (head, body) = request.into_parts();
+    let origin = origin(&head.headers);
     let rest = head.uri.path().strip_prefix("/v2/").unwrap_or_default();
     let route = path::decode(rest)
         .ok_or_else(OciError::unknown_route)
         .and_then(|rest| path::parse(&head.method, &rest));
-    match route {
+    let mut response = match route {
         Ok(route) => serve(registry, route, &head, body)
             .await
             .unwrap_or_else(IntoResponse::into_response),
         Err(error) => error.into_response(),
+    };
+    absolute_location(&mut response, origin.as_deref());
+    response
+}
+
+/// `scheme://host` as the client addressed us. `None` without a `Host`.
+fn origin(headers: &axum::http::HeaderMap) -> Option<String> {
+    let host = headers.get(axum::http::header::HOST)?.to_str().ok()?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .filter(|scheme| *scheme == "https" || *scheme == "http")
+        .unwrap_or("http");
+    Some(format!("{scheme}://{host}"))
+}
+
+/// The reference answers `Location` as an absolute URL unless
+/// `http.relativeurls` is set (gate B, every push scenario). The routes build
+/// paths; this makes them what the reference sends.
+fn absolute_location(response: &mut Response, origin: Option<&str>) {
+    let Some(origin) = origin else { return };
+    let absolute = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|path| path.starts_with('/'))
+        .and_then(|path| HeaderValue::from_str(&format!("{origin}{path}")).ok());
+    if let Some(absolute) = absolute {
+        response.headers_mut().insert(LOCATION, absolute);
     }
 }
 

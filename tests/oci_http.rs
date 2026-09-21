@@ -934,7 +934,7 @@ mod served {
         };
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{authorization}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{authorization}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .expect("send");
@@ -976,7 +976,7 @@ mod served {
             .expect("timeout");
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .expect("send");
@@ -1124,8 +1124,11 @@ mod served {
             &[],
         );
         assert_eq!(opened.status, 202, "{}", opened.head);
+        // Absolute, as the reference answers it; the raw client wants the path.
         let location = header_of(&opened.head, "location")
             .expect("location")
+            .strip_prefix(&format!("http://127.0.0.1:{}", server.port))
+            .expect("an absolute Location on the address the client used")
             .to_owned();
         let patched = request_with(
             server.port,
