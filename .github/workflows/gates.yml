@@ -25,11 +25,8 @@ jobs:
     name: Gate A · OCI conformance (all four categories)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # Pull and push: 49 of 49 on 0a90892. Reported, not blocking, until all
-    # four categories have been green once in CI. Then this line goes and the
-    # suite blocks (plan, P7 task 6).
-    # While it is here a red suite still shows a green run: read the summary.
-    continue-on-error: true
+    # Blocking. First green on 6d23904: 74 passed, 0 failed, 5 skipped (the
+    # automatic cross-mount specs, which the suite runs only when told to).
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
