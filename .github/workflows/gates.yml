@@ -153,3 +153,56 @@ jobs:
             ${{ runner.temp }}/gate-b.md
             ${{ runner.temp }}/gate-b-self.md
           if-no-files-found: warn
+
+  gate-c:
+    name: Gate C · unchanged clients (docker, skopeo)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gates
+      - name: Build the server
+        run: cargo build --locked --features oci --bin hologram
+      - name: Start Hologram Registry on 5000 and the reference, as a peer, on 5001
+        env:
+          REGISTRY_STORAGE_DELETE_ENABLED: "true"
+        run: |
+          mkdir -p "$RUNNER_TEMP/reg/config"
+          cat > "$RUNNER_TEMP/reg/config/live.toml" <<EOF
+          schema_version = 2
+
+          [paths]
+          config_dir = "$RUNNER_TEMP/reg/config"
+          data_dir = "$RUNNER_TEMP/reg/data"
+          state_dir = "$RUNNER_TEMP/reg/state"
+          cache_dir = "$RUNNER_TEMP/reg/cache"
+
+          [server]
+          listen = "127.0.0.1:5000"
+
+          [modules]
+          enabled = ["dev.hologram.live.system", "dev.hologram.live.oci"]
+          EOF
+          ./target/debug/hologram --config "$RUNNER_TEMP/reg/config/live.toml" serve > "$RUNNER_TEMP/server.log" 2>&1 &
+          source apps/registry/gates/reference.env
+          docker run -d --name reference -p 127.0.0.1:5001:5000 -e REGISTRY_STORAGE_DELETE_ENABLED=true "${REGISTRY_REF/:3@/@}"
+          for port in 5000 5001; do
+            for _ in $(seq 1 60); do
+              if curl -fsS "http://127.0.0.1:$port/v2/" > /dev/null; then continue 2; fi
+              sleep 1
+            done
+            cat "$RUNNER_TEMP/server.log"; exit 1
+          done
+      - name: docker
+        run: apps/registry/gates/clients/docker.sh
+      - name: skopeo
+        run: apps/registry/gates/clients/skopeo.sh
+      - name: The server's log, when a client failed
+        if: failure()
+        run: tail -n 80 "$RUNNER_TEMP/server.log"
