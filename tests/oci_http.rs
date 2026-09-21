@@ -938,10 +938,13 @@ mod served {
             body.len()
         )
         .expect("send");
-        // A server that refuses early may close before the body is through.
-        let _ = stream.write_all(body);
+        stream.write_all(body).expect("send the body");
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).expect("read");
+        parse(&raw)
+    }
+
+    fn parse(raw: &[u8]) -> Answer {
         let split = raw
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -957,6 +960,41 @@ mod served {
             head,
             body: raw[split + 4..].to_vec(),
         }
+    }
+
+    /// A request the server may refuse, sent the way that keeps its answer.
+    ///
+    /// A server that answers and closes while the client is still writing
+    /// resets the connection, and on macOS the reset takes the unread answer
+    /// with it. So the body is offered with `Expect: 100-continue`: a server
+    /// that refuses on the head answers before a byte of body is sent, and one
+    /// that wants the body says so, reads all of it, and then answers.
+    pub fn request_expecting(port: u16, method: &str, path: &str, body: &[u8]) -> Answer {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("timeout");
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("send");
+        let mut raw = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let end_of_head = |raw: &[u8]| raw.windows(4).position(|window| window == b"\r\n\r\n");
+        while end_of_head(&raw).is_none() {
+            let n = stream.read(&mut buffer).expect("read the first answer");
+            assert!(n > 0, "the server closed without answering");
+            raw.extend_from_slice(&buffer[..n]);
+        }
+        if raw.starts_with(b"HTTP/1.1 100") {
+            let after = end_of_head(&raw).expect("end of head") + 4;
+            raw.drain(..after);
+            stream.write_all(body).expect("send the body");
+        }
+        stream.read_to_end(&mut raw).expect("read");
+        parse(&raw)
     }
 
     /// Start `hologram serve` on a directory of its own. Every path the binary
@@ -1074,8 +1112,8 @@ mod served {
     fn a_layer_larger_than_the_servers_body_limit_goes_in_and_the_limit_still_binds_the_rest() {
         let root = tempfile::tempdir().expect("tempdir");
         let server = start(root.path(), true);
-        // One MiB over the server-wide limit of 32 MiB.
-        let layer = vec![7_u8; 33 << 20];
+        // One byte over the server-wide limit of 32 MiB.
+        let layer = vec![7_u8; (32 << 20) + 1];
 
         let opened = request_with(
             server.port,
@@ -1098,16 +1136,9 @@ mod served {
             &layer,
         );
         assert_eq!(patched.status, 202, "{}", patched.head);
-        assert_eq!(header_of(&patched.head, "range"), Some("0-34603007"));
+        assert_eq!(header_of(&patched.head, "range"), Some("0-33554432"));
 
-        let object = request_with(
-            server.port,
-            "POST",
-            "/api/v1/objects",
-            true,
-            "application/octet-stream",
-            &layer,
-        );
+        let object = request_expecting(server.port, "POST", "/api/v1/objects", &layer);
         assert_eq!(object.status, 413, "{}", object.head);
     }
 
