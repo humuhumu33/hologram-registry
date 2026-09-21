@@ -1,0 +1,537 @@
+#![cfg(feature = "oci")]
+//! The registry's read path over HTTP: first against the handler, then
+//! through the real binary, where the bearer layer and the HTTP stack are.
+
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use axum::response::Response;
+use hologram_live::modules::oci::handle;
+use hologram_live::oci_store::{
+    Digest, LinkKind, ManifestPlan, OciStore, OpenOptions, Reference, RepoName,
+};
+use std::sync::Arc;
+use std::time::Duration;
+
+const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+fn options() -> OpenOptions {
+    OpenOptions {
+        create: true,
+        upload_max_age: Duration::from_hours(7 * 24),
+    }
+}
+
+fn repo(name: &str) -> RepoName {
+    RepoName::parse(name).expect("repository name")
+}
+
+/// 3 MiB that do not repeat, so a range that starts in the wrong place shows.
+fn layer() -> Vec<u8> {
+    let mut out = vec![0_u8; 3 << 20];
+    blake3::Hasher::new()
+        .update(b"oci_http layer")
+        .finalize_xof()
+        .fill(&mut out);
+    out
+}
+
+fn push_blob(store: &OciStore, name: &str, bytes: &[u8]) -> Digest {
+    let id = store.upload_begin(&repo(name)).expect("begin");
+    store.upload_append(&id, 0, bytes).expect("append");
+    let digest = Digest::sha256_of(bytes);
+    store.upload_finish(&id, &digest).expect("finish")
+}
+
+/// One layer and one manifest tagged `v1` in `team/app`. Returns the layer's
+/// digest, the manifest's digest and the manifest's bytes.
+fn seed(store: &OciStore) -> (Digest, Digest, Vec<u8>) {
+    let layer_digest = push_blob(store, "team/app", &layer());
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"{MANIFEST_TYPE}","layers":[{{"digest":"{layer_digest}"}}]}}"#
+    )
+    .into_bytes();
+    let plan = ManifestPlan {
+        kind: LinkKind::Manifest,
+        must_exist: vec![layer_digest.clone()],
+        subject: None,
+    };
+    let digest = store
+        .manifest_put(
+            &repo("team/app"),
+            &Reference::parse("v1").expect("tag"),
+            MANIFEST_TYPE,
+            &manifest,
+            &plan,
+        )
+        .expect("manifest");
+    (layer_digest, digest, manifest)
+}
+
+struct Volume {
+    _dir: tempfile::TempDir,
+    store: Arc<OciStore>,
+}
+
+fn volume() -> Volume {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(OciStore::open(dir.path(), options()).expect("open"));
+    Volume { _dir: dir, store }
+}
+
+async fn send(volume: &Volume, method: &str, path: &str, headers: &[(&str, &str)]) -> Response {
+    let mut request = Request::builder().method(method).uri(path);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    handle(
+        volume.store.clone(),
+        request.body(Body::empty()).expect("request"),
+    )
+    .await
+}
+
+fn header<'a>(response: &'a Response, name: &str) -> &'a str {
+    response
+        .headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("no {name} header"))
+        .to_str()
+        .expect("header text")
+}
+
+async fn body(response: Response) -> Vec<u8> {
+    to_bytes(response.into_body(), 8 << 20)
+        .await
+        .expect("body")
+        .to_vec()
+}
+
+async fn error_code(response: Response) -> String {
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(
+        header(&response, "docker-distribution-api-version"),
+        "registry/2.0"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&body(response).await).expect("json");
+    value["errors"][0]["code"]
+        .as_str()
+        .expect("error code")
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_base_route_answers_an_empty_object() {
+    let volume = volume();
+    let response = send(&volume, "GET", "/v2/", &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(body(response).await, b"{}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_is_served_whole_with_its_headers() {
+    let volume = volume();
+    let (digest, _, _) = seed(&volume.store);
+    let response = send(&volume, "GET", &format!("/v2/team/app/blobs/{digest}"), &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-length"), (3 << 20).to_string());
+    assert_eq!(header(&response, "docker-content-digest"), digest.as_str());
+    assert_eq!(header(&response, "etag"), format!("\"{digest}\""));
+    assert_eq!(
+        header(&response, "content-type"),
+        "application/octet-stream"
+    );
+    assert_eq!(header(&response, "accept-ranges"), "bytes");
+    assert_eq!(body(response).await, layer());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn head_says_the_length_and_sends_nothing() {
+    let volume = volume();
+    let (digest, _, _) = seed(&volume.store);
+    let response = send(
+        &volume,
+        "HEAD",
+        &format!("/v2/team/app/blobs/{digest}"),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-length"), (3 << 20).to_string());
+    assert_eq!(header(&response, "docker-content-digest"), digest.as_str());
+    assert!(body(response).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_range_forms_over_http() {
+    let volume = volume();
+    let (digest, _, _) = seed(&volume.store);
+    let path = format!("/v2/team/app/blobs/{digest}");
+    let bytes = layer();
+    let size = bytes.len();
+
+    let one = send(&volume, "GET", &path, &[("range", "bytes=1048570-1048589")]).await;
+    assert_eq!(one.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header(&one, "content-range"),
+        format!("bytes 1048570-1048589/{size}")
+    );
+    assert_eq!(header(&one, "content-length"), "20");
+    assert_eq!(body(one).await, &bytes[1_048_570..1_048_590]);
+
+    let open_ended = send(&volume, "GET", &path, &[("range", "bytes=3145700-")]).await;
+    assert_eq!(open_ended.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body(open_ended).await, &bytes[3_145_700..]);
+
+    let suffix = send(&volume, "GET", &path, &[("range", "bytes=-16")]).await;
+    assert_eq!(suffix.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body(suffix).await, &bytes[size - 16..]);
+
+    let past = send(&volume, "GET", &path, &[("range", "bytes=9999999-")]).await;
+    assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(header(&past, "content-range"), format!("bytes */{size}"));
+    assert_eq!(error_code(past).await, "RANGE_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_is_served_only_from_a_repository_that_links_it() {
+    let volume = volume();
+    let (digest, _, _) = seed(&volume.store);
+    let elsewhere = send(
+        &volume,
+        "GET",
+        &format!("/v2/other/app/blobs/{digest}"),
+        &[],
+    )
+    .await;
+    assert_eq!(elsewhere.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(elsewhere).await, "BLOB_UNKNOWN");
+
+    let absent = Digest::sha256_of(b"never pushed");
+    let missing = send(
+        &volume,
+        "HEAD",
+        &format!("/v2/team/app/blobs/{absent}"),
+        &[],
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let malformed = send(&volume, "GET", "/v2/team/app/blobs/sha256:abc", &[]).await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(malformed).await, "DIGEST_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_answers_to_its_blake3_name_too() {
+    let volume = volume();
+    let (digest, _, _) = seed(&volume.store);
+    let blake3 = Digest::from_blake3(&blake3::hash(&layer()));
+    let response = send(&volume, "GET", &format!("/v2/team/app/blobs/{blake3}"), &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "docker-content-digest"),
+        blake3.as_str(),
+        "the client verifies against the name it asked by"
+    );
+    assert_ne!(blake3, digest);
+    assert_eq!(body(response).await, layer());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn if_none_match_is_304() {
+    let volume = volume();
+    let (digest, manifest_digest, _) = seed(&volume.store);
+    let etag = format!("\"{digest}\"");
+    let blob = send(
+        &volume,
+        "GET",
+        &format!("/v2/team/app/blobs/{digest}"),
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(blob.status(), StatusCode::NOT_MODIFIED);
+    assert!(body(blob).await.is_empty());
+
+    let etag = format!("\"{manifest_digest}\"");
+    let manifest = send(
+        &volume,
+        "GET",
+        "/v2/team/app/manifests/v1",
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(manifest.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manifest_by_tag_and_by_digest() {
+    let volume = volume();
+    let (_, digest, bytes) = seed(&volume.store);
+    for reference in ["v1".to_owned(), digest.to_string()] {
+        let path = format!("/v2/team/app/manifests/{reference}");
+        let response = send(&volume, "GET", &path, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{reference}");
+        assert_eq!(header(&response, "content-type"), MANIFEST_TYPE);
+        assert_eq!(header(&response, "docker-content-digest"), digest.as_str());
+        assert_eq!(header(&response, "etag"), format!("\"{digest}\""));
+        assert_eq!(header(&response, "content-length"), bytes.len().to_string());
+        assert_eq!(body(response).await, bytes);
+
+        let head = send(&volume, "HEAD", &path, &[]).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(header(&head, "content-length"), bytes.len().to_string());
+        assert!(body(head).await.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_manifest_is_manifest_unknown() {
+    let volume = volume();
+    seed(&volume.store);
+    for path in [
+        "/v2/team/app/manifests/nope",
+        "/v2/never/seen/manifests/v1",
+        &format!("/v2/team/app/manifests/{}", Digest::sha256_of(b"absent")),
+    ] {
+        let response = send(&volume, "GET", path, &[]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(error_code(response).await, "MANIFEST_UNKNOWN", "{path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_percent_encoded_digest_is_read_once() {
+    let volume = volume();
+    let (digest, _, _) = seed(&volume.store);
+    let encoded = digest.as_str().replace(':', "%3A");
+    let response = send(
+        &volume,
+        "HEAD",
+        &format!("/v2/team/app/blobs/{encoded}"),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let hidden = send(&volume, "GET", "/v2/team%2Fapp/tags/list", &[]).await;
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_method_and_an_unknown_path() {
+    let volume = volume();
+    let wrong = send(&volume, "POST", "/v2/team/app/manifests/v1", &[]).await;
+    assert_eq!(wrong.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(header(&wrong, "allow"), "DELETE, GET, HEAD, PUT");
+    let unknown = send(&volume, "GET", "/v2/team/app/nothing/here", &[]).await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        header(&unknown, "docker-distribution-api-version"),
+        "registry/2.0"
+    );
+}
+
+// ---- Through the binary ----------------------------------------------------
+
+mod served {
+    use super::{header_of, options, seed};
+    use hologram_live::config::AppConfig;
+    use hologram_live::oci_store::OciStore;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const TOKEN_ENV: &str = "HOLOGRAM_OCI_HTTP_TEST_TOKEN";
+    const TOKEN: &str = "a-token-only-this-test-knows";
+
+    pub struct Server {
+        child: Child,
+        pub port: u16,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    pub struct Answer {
+        pub status: u16,
+        pub head: String,
+        pub body: Vec<u8>,
+    }
+
+    /// One HTTP/1.1 exchange, read until the server closes.
+    pub fn request(port: u16, method: &str, path: &str, token: bool) -> Answer {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let authorization = if token {
+            format!("Authorization: Bearer {TOKEN}\r\n")
+        } else {
+            String::new()
+        };
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{authorization}Connection: close\r\n\r\n"
+        )
+        .expect("send");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read");
+        let split = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("end of head");
+        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status");
+        Answer {
+            status,
+            head,
+            body: raw[split + 4..].to_vec(),
+        }
+    }
+
+    /// Start `hologram serve` on a directory of its own. Every path the binary
+    /// could reach for is inside `root`; the configuration is named on the
+    /// command line, so no configuration outside the test is ever read.
+    pub fn start(root: &Path, with_registry: bool) -> Server {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("address")
+            .port();
+        let mut config = AppConfig::default();
+        config.paths.config_dir = root.join("config");
+        config.paths.data_dir = root.join("data");
+        config.paths.state_dir = root.join("state");
+        config.paths.cache_dir = root.join("cache");
+        config.server.listen = format!("127.0.0.1:{port}");
+        config.auth.required = true;
+        TOKEN_ENV.clone_into(&mut config.auth.token_env);
+        if with_registry {
+            config
+                .modules
+                .enabled
+                .push(hologram_live::modules::oci::MODULE_ID.to_owned());
+        }
+        std::fs::create_dir_all(root.join("config")).expect("config directory");
+        let path = root.join("config/live.toml");
+        std::fs::write(&path, toml::to_string_pretty(&config).expect("encode")).expect("write");
+
+        let child = Command::new(env!("CARGO_BIN_EXE_hologram"))
+            .arg("--config")
+            .arg(&path)
+            .arg("serve")
+            .env("HOME", root)
+            .env("USERPROFILE", root)
+            .env("HOLOGRAM_CONFIG_DIR", root.join("config"))
+            .env(TOKEN_ENV, TOKEN)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hologram serve");
+        let server = Server { child, port };
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "the server did not start");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        server
+    }
+
+    #[test]
+    fn the_registry_answers_for_itself_and_the_rest_stays_behind_the_token() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // Seed the volume before the server takes its lock.
+        let (layer, manifest, manifest_bytes) = {
+            let store = OciStore::open(&root.path().join("data"), options()).expect("open");
+            seed(&store)
+        };
+        let server = start(root.path(), true);
+
+        let base = request(server.port, "GET", "/v2/", false);
+        assert_eq!(base.status, 200, "{}", base.head);
+        assert_eq!(base.body, b"{}");
+        assert_eq!(
+            header_of(&base.head, "docker-distribution-api-version"),
+            Some("registry/2.0")
+        );
+
+        let modules = request(server.port, "GET", "/api/v1/modules", false);
+        assert_eq!(modules.status, 401);
+        assert!(String::from_utf8_lossy(&modules.body).contains("LIVE_AUTHENTICATION_FAILED"));
+        let modules = request(server.port, "GET", "/api/v1/modules", true);
+        assert_eq!(modules.status, 200);
+        assert!(String::from_utf8_lossy(&modules.body).contains("dev.hologram.live.oci"));
+
+        // Through the real HTTP stack a HEAD keeps the blob's length and sends no body.
+        let head = request(
+            server.port,
+            "HEAD",
+            &format!("/v2/team/app/blobs/{layer}"),
+            false,
+        );
+        assert_eq!(head.status, 200, "{}", head.head);
+        assert_eq!(header_of(&head.head, "content-length"), Some("3145728"));
+        assert!(head.body.is_empty());
+
+        let pulled = request(server.port, "GET", "/v2/team/app/manifests/v1", false);
+        assert_eq!(pulled.status, 200);
+        assert_eq!(pulled.body, manifest_bytes);
+        assert_eq!(
+            header_of(&pulled.head, "docker-content-digest"),
+            Some(manifest.as_str())
+        );
+
+        let blob = request(
+            server.port,
+            "GET",
+            &format!("/v2/team/app/blobs/{layer}"),
+            false,
+        );
+        assert_eq!(blob.status, 200);
+        assert_eq!(blob.body.len(), 3 << 20);
+
+        let error = request(server.port, "GET", "/v2/team/app/manifests/nope", false);
+        assert_eq!(error.status, 404);
+        assert_eq!(
+            header_of(&error.head, "docker-distribution-api-version"),
+            Some("registry/2.0")
+        );
+        assert!(String::from_utf8_lossy(&error.body).contains("MANIFEST_UNKNOWN"));
+    }
+
+    #[test]
+    fn without_the_module_v2_is_the_servers_own_404() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let server = start(root.path(), false);
+        let answer = request(server.port, "GET", "/v2/", true);
+        assert_eq!(answer.status, 404);
+        assert!(String::from_utf8_lossy(&answer.body).contains("LIVE_NOT_FOUND"));
+        assert_eq!(
+            header_of(&answer.head, "docker-distribution-api-version"),
+            None
+        );
+        assert!(
+            !root.path().join("data/HOLOGRAM_REGISTRY_LAYOUT").exists(),
+            "no volume is made for a module that is off"
+        );
+    }
+}
+
+/// The value of header `name` in a raw response head.
+fn header_of<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}

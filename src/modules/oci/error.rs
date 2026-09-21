@@ -1,0 +1,468 @@
+//! The registry's error envelope, and the one place a store error becomes a
+//! registry error code.
+//!
+//! Messages and `detail` payloads follow `contracts/registry-api.md`. The
+//! contract marks them as recalled: golden transcript 4 (gate B) records what
+//! the reference sends, and corrects this file where they differ.
+
+use super::respond::stamp_version;
+use crate::oci_store::OciStoreError;
+use axum::http::header::{HeaderName, ALLOW, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use serde_json::{json, Value};
+use std::borrow::Cow;
+
+/// The 18 documented codes, and `UNKNOWN` for an internal failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCode {
+    BlobUnknown,
+    BlobUploadInvalid,
+    BlobUploadUnknown,
+    DigestInvalid,
+    ManifestBlobUnknown,
+    ManifestInvalid,
+    ManifestUnknown,
+    ManifestUnverified,
+    NameInvalid,
+    NameUnknown,
+    PaginationNumberInvalid,
+    RangeInvalid,
+    SizeInvalid,
+    TagInvalid,
+    Unauthorized,
+    Denied,
+    Unsupported,
+    TooManyRequests,
+    Unknown,
+}
+
+impl ErrorCode {
+    pub const ALL: [Self; 19] = [
+        Self::BlobUnknown,
+        Self::BlobUploadInvalid,
+        Self::BlobUploadUnknown,
+        Self::DigestInvalid,
+        Self::ManifestBlobUnknown,
+        Self::ManifestInvalid,
+        Self::ManifestUnknown,
+        Self::ManifestUnverified,
+        Self::NameInvalid,
+        Self::NameUnknown,
+        Self::PaginationNumberInvalid,
+        Self::RangeInvalid,
+        Self::SizeInvalid,
+        Self::TagInvalid,
+        Self::Unauthorized,
+        Self::Denied,
+        Self::Unsupported,
+        Self::TooManyRequests,
+        Self::Unknown,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BlobUnknown => "BLOB_UNKNOWN",
+            Self::BlobUploadInvalid => "BLOB_UPLOAD_INVALID",
+            Self::BlobUploadUnknown => "BLOB_UPLOAD_UNKNOWN",
+            Self::DigestInvalid => "DIGEST_INVALID",
+            Self::ManifestBlobUnknown => "MANIFEST_BLOB_UNKNOWN",
+            Self::ManifestInvalid => "MANIFEST_INVALID",
+            Self::ManifestUnknown => "MANIFEST_UNKNOWN",
+            Self::ManifestUnverified => "MANIFEST_UNVERIFIED",
+            Self::NameInvalid => "NAME_INVALID",
+            Self::NameUnknown => "NAME_UNKNOWN",
+            Self::PaginationNumberInvalid => "PAGINATION_NUMBER_INVALID",
+            Self::RangeInvalid => "RANGE_INVALID",
+            Self::SizeInvalid => "SIZE_INVALID",
+            Self::TagInvalid => "TAG_INVALID",
+            Self::Unauthorized => "UNAUTHORIZED",
+            Self::Denied => "DENIED",
+            Self::Unsupported => "UNSUPPORTED",
+            Self::TooManyRequests => "TOOMANYREQUESTS",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::BlobUnknown
+            | Self::BlobUploadInvalid
+            | Self::BlobUploadUnknown
+            | Self::ManifestUnknown
+            | Self::NameUnknown => StatusCode::NOT_FOUND,
+            Self::DigestInvalid
+            | Self::ManifestBlobUnknown
+            | Self::ManifestInvalid
+            | Self::ManifestUnverified
+            | Self::NameInvalid
+            | Self::PaginationNumberInvalid
+            | Self::SizeInvalid
+            | Self::TagInvalid => StatusCode::BAD_REQUEST,
+            Self::RangeInvalid => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Denied => StatusCode::FORBIDDEN,
+            Self::Unsupported => StatusCode::METHOD_NOT_ALLOWED,
+            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            Self::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub fn default_message(self) -> &'static str {
+        match self {
+            Self::BlobUnknown | Self::ManifestBlobUnknown => "blob unknown to registry",
+            Self::BlobUploadInvalid => "blob upload invalid",
+            Self::BlobUploadUnknown => "blob upload unknown to registry",
+            Self::DigestInvalid => "provided digest did not match uploaded content",
+            Self::ManifestInvalid => "manifest invalid",
+            Self::ManifestUnknown => "manifest unknown",
+            Self::ManifestUnverified => "manifest failed signature verification",
+            Self::NameInvalid => "invalid repository name",
+            Self::NameUnknown => "repository name not known to registry",
+            Self::PaginationNumberInvalid => "invalid number of results requested",
+            Self::RangeInvalid => "invalid content range",
+            Self::SizeInvalid => "provided length did not match content length",
+            Self::TagInvalid => "manifest tag did not match URI",
+            Self::Unauthorized => "authentication required",
+            Self::Denied => "requested access to the resource is denied",
+            Self::Unsupported => "The operation is unsupported.",
+            Self::TooManyRequests => "too many requests",
+            Self::Unknown => "unknown error",
+        }
+    }
+}
+
+/// Which route asked the store. One store error maps differently by route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Context {
+    Blob,
+    Manifest,
+    Upload,
+    Tags,
+}
+
+/// A refusal under `/v2/`. Boxed, so a `Result` that carries one stays small.
+#[derive(Debug)]
+pub struct OciError(Box<Refusal>);
+
+#[derive(Debug)]
+struct Refusal {
+    /// `None` is the one answer without an envelope: a path no route claims.
+    code: Option<ErrorCode>,
+    message: Cow<'static, str>,
+    detail: Value,
+    headers: HeaderMap,
+}
+
+impl OciError {
+    pub fn new(code: ErrorCode) -> Self {
+        Self(Box::new(Refusal {
+            code: Some(code),
+            message: Cow::Borrowed(code.default_message()),
+            detail: Value::Null,
+            headers: HeaderMap::new(),
+        }))
+    }
+
+    #[must_use]
+    pub fn with_detail(mut self, detail: Value) -> Self {
+        self.0.detail = detail;
+        self
+    }
+
+    #[must_use]
+    pub fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.0.headers.insert(name, value);
+        self
+    }
+
+    /// A path under `/v2/` that is no route. The reference answers from its
+    /// router, before the registry's own error shape exists: plain text.
+    pub fn unknown_route() -> Self {
+        Self(Box::new(Refusal {
+            code: None,
+            message: Cow::Borrowed("404 page not found\n"),
+            detail: Value::Null,
+            headers: HeaderMap::new(),
+        }))
+    }
+
+    /// A known path with a method it does not take.
+    pub fn wrong_method(allow: &'static str) -> Self {
+        Self::new(ErrorCode::Unsupported).with_header(ALLOW, HeaderValue::from_static(allow))
+    }
+
+    /// An internal failure. The cause is logged here and never sent.
+    pub fn internal(cause: &dyn std::fmt::Display) -> Self {
+        tracing::error!(%cause, "registry request failed");
+        Self::new(ErrorCode::Unknown)
+    }
+
+    pub fn code(&self) -> Option<ErrorCode> {
+        self.0.code
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.0.code.map_or(StatusCode::NOT_FOUND, ErrorCode::status)
+    }
+
+    pub fn from_store(error: OciStoreError, context: Context) -> Self {
+        match error {
+            OciStoreError::Invalid { what, value } => match what {
+                "digest" => Self::new(ErrorCode::DigestInvalid).with_detail(json!(value)),
+                "repository name" => Self::new(ErrorCode::NameInvalid).with_detail(json!(value)),
+                "tag" => Self::new(ErrorCode::TagInvalid).with_detail(json!(value)),
+                "upload id" => Self::new(ErrorCode::BlobUploadUnknown),
+                other => Self::internal(&format!("invalid {other}: {value:?}")),
+            },
+            OciStoreError::NotInRepository { repo, digest } => match context {
+                Context::Manifest | Context::Tags => Self::new(ErrorCode::ManifestUnknown)
+                    .with_detail(json!({ "Name": repo, "Revision": digest })),
+                Context::Blob | Context::Upload => {
+                    Self::new(ErrorCode::BlobUnknown).with_detail(json!(digest))
+                }
+            },
+            OciStoreError::UnknownRepository(repo) => match context {
+                Context::Tags => {
+                    Self::new(ErrorCode::NameUnknown).with_detail(json!({ "name": repo }))
+                }
+                Context::Manifest => {
+                    Self::new(ErrorCode::ManifestUnknown).with_detail(json!({ "Name": repo }))
+                }
+                Context::Blob | Context::Upload => Self::new(ErrorCode::BlobUnknown),
+            },
+            OciStoreError::UnknownUpload(_) => Self::new(ErrorCode::BlobUploadUnknown),
+            OciStoreError::DigestMismatch { claimed } => {
+                Self::new(ErrorCode::DigestInvalid).with_detail(json!(claimed))
+            }
+            OciStoreError::OffsetMismatch { expected, .. } => {
+                let range = format!("0-{}", expected.saturating_sub(1));
+                let error = Self::new(ErrorCode::RangeInvalid);
+                match HeaderValue::from_str(&range) {
+                    Ok(value) => error.with_header(axum::http::header::RANGE, value),
+                    Err(_) => error,
+                }
+            }
+            OciStoreError::MissingReferences(digests) => {
+                Self::new(ErrorCode::ManifestBlobUnknown).with_detail(json!(digests))
+            }
+            error @ (OciStoreError::Io(_) | OciStoreError::Locked | OciStoreError::Layout(_)) => {
+                Self::internal(&error)
+            }
+        }
+    }
+}
+
+impl IntoResponse for OciError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        let Refusal {
+            code,
+            message,
+            detail,
+            headers,
+        } = *self.0;
+        let mut response = match code {
+            None => {
+                let mut response = (status, message.into_owned()).into_response();
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; charset=utf-8"),
+                );
+                response
+            }
+            Some(code) => {
+                let mut entry = json!({ "code": code.as_str(), "message": message });
+                if !detail.is_null() {
+                    entry["detail"] = detail;
+                }
+                let body = json!({ "errors": [entry] }).to_string();
+                let mut response = (status, body).into_response();
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                response
+            }
+        };
+        response.headers_mut().extend(headers);
+        // The module's layer adds this too; an error built and answered in a
+        // test, or by a caller outside the layer, still carries it.
+        stamp_version(response.headers_mut());
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn parts(error: OciError) -> (StatusCode, HeaderMap, Value) {
+        let response = error.into_response();
+        let (head, body) = response.into_parts();
+        let mut stream = body.into_data_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
+            bytes.extend_from_slice(&chunk.expect("chunk"));
+        }
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (head.status, head.headers, value)
+    }
+
+    #[tokio::test]
+    async fn every_code_answers_in_the_registry_envelope() {
+        for code in ErrorCode::ALL {
+            let (status, headers, body) = parts(OciError::new(code)).await;
+            assert_eq!(status, code.status(), "{code:?}");
+            assert_eq!(headers[CONTENT_TYPE], "application/json", "{code:?}");
+            assert_eq!(
+                headers["docker-distribution-api-version"], "registry/2.0",
+                "{code:?}"
+            );
+            let errors = body["errors"].as_array().expect("errors array");
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0]["code"], code.as_str());
+            assert_eq!(errors[0]["message"], code.default_message());
+            assert!(errors[0].get("detail").is_none(), "no detail, no key");
+        }
+    }
+
+    #[test]
+    fn the_status_of_each_code_is_the_documented_one() {
+        let expected = [
+            ("BLOB_UNKNOWN", 404),
+            ("BLOB_UPLOAD_INVALID", 404),
+            ("BLOB_UPLOAD_UNKNOWN", 404),
+            ("DIGEST_INVALID", 400),
+            ("MANIFEST_BLOB_UNKNOWN", 400),
+            ("MANIFEST_INVALID", 400),
+            ("MANIFEST_UNKNOWN", 404),
+            ("MANIFEST_UNVERIFIED", 400),
+            ("NAME_INVALID", 400),
+            ("NAME_UNKNOWN", 404),
+            ("PAGINATION_NUMBER_INVALID", 400),
+            ("RANGE_INVALID", 416),
+            ("SIZE_INVALID", 400),
+            ("TAG_INVALID", 400),
+            ("UNAUTHORIZED", 401),
+            ("DENIED", 403),
+            ("UNSUPPORTED", 405),
+            ("TOOMANYREQUESTS", 429),
+            ("UNKNOWN", 500),
+        ];
+        for (code, (name, status)) in ErrorCode::ALL.iter().zip(expected) {
+            assert_eq!(code.as_str(), name);
+            assert_eq!(code.status().as_u16(), status, "{name}");
+        }
+    }
+
+    #[test]
+    fn one_store_error_maps_by_route() {
+        let missing = || OciStoreError::NotInRepository {
+            repo: "app".to_owned(),
+            digest: "sha256:00".to_owned(),
+        };
+        let code = |error, context| OciError::from_store(error, context).code();
+        assert_eq!(
+            code(missing(), Context::Blob),
+            Some(ErrorCode::BlobUnknown)
+        );
+        assert_eq!(
+            code(missing(), Context::Manifest),
+            Some(ErrorCode::ManifestUnknown)
+        );
+        let unknown = || OciStoreError::UnknownRepository("app".to_owned());
+        assert_eq!(code(unknown(), Context::Tags), Some(ErrorCode::NameUnknown));
+        assert_eq!(
+            code(unknown(), Context::Manifest),
+            Some(ErrorCode::ManifestUnknown)
+        );
+        assert_eq!(code(unknown(), Context::Blob), Some(ErrorCode::BlobUnknown));
+        let invalid = |what| OciStoreError::Invalid {
+            what,
+            value: "x".to_owned(),
+        };
+        assert_eq!(
+            code(invalid("digest"), Context::Blob),
+            Some(ErrorCode::DigestInvalid)
+        );
+        assert_eq!(
+            code(invalid("repository name"), Context::Blob),
+            Some(ErrorCode::NameInvalid)
+        );
+        assert_eq!(
+            code(invalid("tag"), Context::Manifest),
+            Some(ErrorCode::TagInvalid)
+        );
+        assert_eq!(
+            code(invalid("upload id"), Context::Upload),
+            Some(ErrorCode::BlobUploadUnknown)
+        );
+        assert_eq!(
+            code(
+                OciStoreError::UnknownUpload("u".to_owned()),
+                Context::Upload
+            ),
+            Some(ErrorCode::BlobUploadUnknown)
+        );
+        assert_eq!(
+            code(
+                OciStoreError::DigestMismatch {
+                    claimed: "sha256:00".to_owned()
+                },
+                Context::Upload
+            ),
+            Some(ErrorCode::DigestInvalid)
+        );
+        assert_eq!(
+            code(
+                OciStoreError::MissingReferences(vec!["sha256:00".to_owned()]),
+                Context::Manifest
+            ),
+            Some(ErrorCode::ManifestBlobUnknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_offset_says_where_the_upload_stands() {
+        let error = OciError::from_store(
+            OciStoreError::OffsetMismatch {
+                expected: 100,
+                got: 7,
+            },
+            Context::Upload,
+        );
+        let (status, headers, _) = parts(error).await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(headers["range"], "0-99");
+    }
+
+    #[tokio::test]
+    async fn an_internal_failure_never_sends_its_cause() {
+        let error = OciError::from_store(
+            OciStoreError::Io("open /secret/path: denied".to_owned()),
+            Context::Blob,
+        );
+        let (status, _, body) = parts(error).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["errors"][0]["code"], "UNKNOWN");
+        assert!(!body.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_route_is_the_reference_routers_plain_404() {
+        let response = OciError::unknown_route().into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_method_names_the_right_ones() {
+        let (status, headers, body) = parts(OciError::wrong_method("GET, HEAD")).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(headers[ALLOW], "GET, HEAD");
+        assert_eq!(body["errors"][0]["code"], "UNSUPPORTED");
+    }
+}

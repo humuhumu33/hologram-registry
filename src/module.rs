@@ -60,9 +60,27 @@ pub trait LiveModule: Send + Sync {
         OpenApiBuilder::new().build()
     }
 
+    /// Whether the module answers for its own authentication.
+    ///
+    /// The server wraps every other module's routes in the bearer layer. A
+    /// module that speaks a protocol with its own challenge (the registry API
+    /// answers `401` with `WWW-Authenticate`, in its own error shape) returns
+    /// `true` and is mounted beside that layer, not under it (ADR 026).
+    fn authenticates_itself(&self) -> bool {
+        false
+    }
+
     fn start<'a>(&'a self, _context: &'a ModuleContext) -> ModuleStartFuture<'a> {
         Box::pin(async { Ok(()) })
     }
+}
+
+/// The enabled modules' routes, split by who authenticates them.
+pub struct ModuleRouters {
+    /// Behind the server's bearer layer.
+    pub protected: Router<AppState>,
+    /// Mounted as they are: each module here authenticates itself.
+    pub open: Router<AppState>,
 }
 
 pub struct ModuleRegistry {
@@ -155,9 +173,23 @@ impl ModuleRegistry {
     }
 
     pub fn router(&self) -> Router<AppState> {
-        self.modules.iter().fold(Router::new(), |router, module| {
-            router.merge(module.router())
-        })
+        let routers = self.routers();
+        routers.protected.merge(routers.open)
+    }
+
+    pub fn routers(&self) -> ModuleRouters {
+        let mut routers = ModuleRouters {
+            protected: Router::new(),
+            open: Router::new(),
+        };
+        for module in &self.modules {
+            if module.authenticates_itself() {
+                routers.open = routers.open.merge(module.router());
+            } else {
+                routers.protected = routers.protected.merge(module.router());
+            }
+        }
+        routers
     }
 
     pub async fn start(&self, context: &ModuleContext) -> Result<()> {
@@ -223,6 +255,31 @@ mod tests {
         assert!(registry.supports(crate::protocol::operation::HOLO_INSPECT));
         assert!(registry.supports(crate::protocol::operation::HOLO_PLAN));
         assert!(registry.supports(crate::protocol::operation::HOLO_RUN));
+    }
+
+    /// The registry module is in the catalogue and off until it is named.
+    #[cfg(feature = "oci")]
+    #[test]
+    fn the_registry_module_is_opt_in_and_mounted_outside_the_bearer_layer() {
+        let id = crate::modules::oci::MODULE_ID;
+        assert!(crate::modules::builtin_ids()
+            .iter()
+            .any(|known| known == id));
+        assert!(!crate::modules::default_builtin_ids()
+            .iter()
+            .any(|known| known == id));
+
+        let mut enabled = crate::config::ModulesConfig::default().enabled;
+        let stock = ModuleRegistry::build(&enabled).expect("resolve");
+        assert!(!stock.routers().open.has_routes());
+        enabled.push(id.to_owned());
+        let with_registry = ModuleRegistry::build(&enabled).expect("resolve");
+        let routers = with_registry.routers();
+        assert!(
+            routers.open.has_routes(),
+            "/v2/ is mounted beside the layer"
+        );
+        assert!(routers.protected.has_routes());
     }
 
     #[test]

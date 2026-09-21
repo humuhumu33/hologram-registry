@@ -8,7 +8,7 @@ use crate::history::HistoryService;
 use crate::holo::{HoloCatalog, HoloRuntime};
 use crate::holo_capability::{EffectiveGrant, GrantSource};
 use crate::models::ModelCatalog;
-use crate::module::{ModuleContext, ModuleRegistry};
+use crate::module::{ModuleContext, ModuleRegistry, ModuleRouters};
 use crate::nodes::NodeDirectory;
 use crate::observability::TracingHandle;
 use crate::plugin::PluginRegistry;
@@ -27,6 +27,8 @@ struct AppInner {
     modules: ModuleRegistry,
     store: Arc<ObjectStore>,
     registry: Arc<dyn RegistryProvider>,
+    #[cfg(feature = "oci")]
+    oci_store: Option<Arc<crate::oci_store::OciStore>>,
     holo_catalog: Arc<HoloCatalog>,
     holo_runtime: Arc<HoloRuntime>,
     history: Arc<HistoryService>,
@@ -53,6 +55,8 @@ impl AppState {
         let modules = ModuleRegistry::build(&config.modules.enabled)?;
         let store = Arc::new(ObjectStore::open(config.paths.data_dir.join("registry"))?);
         let registry = build_registry(&config, store.clone()).await?;
+        #[cfg(feature = "oci")]
+        let oci_store = open_oci_store(&config).await?;
         let holo_catalog = Arc::new(HoloCatalog::new(store.clone()));
         let actor_system = ActorSystem::start();
         let audit = AuditLog::open(
@@ -118,6 +122,8 @@ impl AppState {
                 modules,
                 store,
                 registry,
+                #[cfg(feature = "oci")]
+                oci_store,
                 holo_catalog,
                 holo_runtime,
                 history,
@@ -147,6 +153,12 @@ impl AppState {
 
     pub fn registry(&self) -> &Arc<dyn RegistryProvider> {
         &self.inner.registry
+    }
+
+    /// The registry volume. `None` unless `dev.hologram.live.oci` is enabled.
+    #[cfg(feature = "oci")]
+    pub fn oci_store(&self) -> Option<&Arc<crate::oci_store::OciStore>> {
+        self.inner.oci_store.as_ref()
     }
 
     pub fn holo_catalog(&self) -> &Arc<HoloCatalog> {
@@ -187,6 +199,10 @@ impl AppState {
 
     pub fn module_router(&self) -> Router<AppState> {
         self.inner.modules.router()
+    }
+
+    pub fn module_routers(&self) -> ModuleRouters {
+        self.inner.modules.routers()
     }
 
     pub(crate) fn module_registry(&self) -> &ModuleRegistry {
@@ -528,6 +544,40 @@ async fn build_registry(
 ) -> Result<Arc<dyn RegistryProvider>> {
     let config = config.clone();
     blocking(move || crate::registry::provider_from_config(&config, store)).await
+}
+
+/// Open the registry volume when the registry module is enabled.
+///
+/// Both databases block on open, and a volume held by another process must
+/// stop the start, not the first request.
+#[cfg(feature = "oci")]
+async fn open_oci_store(config: &AppConfig) -> Result<Option<Arc<crate::oci_store::OciStore>>> {
+    use crate::oci_store::{OciStore, OpenOptions};
+    if !config
+        .modules
+        .enabled
+        .iter()
+        .any(|id| id == crate::modules::oci::MODULE_ID)
+    {
+        return Ok(None);
+    }
+    // The volume is the data directory: its marker, `oci/` and `kappa/` sit
+    // beside the other modules' directories. Registry mode points the data
+    // directory at the volume root.
+    let root = config.paths.data_dir.clone();
+    blocking(move || {
+        let options = OpenOptions {
+            create: true,
+            // The reference purges upload sessions after 168 hours.
+            upload_max_age: std::time::Duration::from_hours(168),
+        };
+        OciStore::open(&root, options)
+            .map(|store| Some(Arc::new(store)))
+            .map_err(|error| {
+                LiveError::Config(format!("registry volume {}: {error}", root.display()))
+            })
+    })
+    .await
 }
 
 async fn blocking<T, F>(function: F) -> Result<T>
