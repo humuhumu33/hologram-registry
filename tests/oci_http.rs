@@ -972,7 +972,7 @@ mod served {
     pub fn request_expecting(port: u16, method: &str, path: &str, body: &[u8]) -> Answer {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
-            .set_read_timeout(Some(Duration::from_secs(60)))
+            .set_read_timeout(Some(Duration::from_mins(1)))
             .expect("timeout");
         write!(
             stream,
