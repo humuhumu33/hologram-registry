@@ -14,6 +14,7 @@ pub mod error;
 mod listing;
 mod manifests;
 mod media;
+mod openapi;
 pub mod path;
 mod respond;
 mod uploads;
@@ -90,6 +91,11 @@ impl LiveModule for OciRegistryModule {
 
     fn authenticates_itself(&self) -> bool {
         true
+    }
+
+    /// Into the server's one document: `/openapi.json` and `/docs` exist already.
+    fn openapi(&self) -> utoipa::openapi::OpenApi {
+        openapi::document()
     }
 }
 

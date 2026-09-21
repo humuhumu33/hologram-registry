@@ -280,6 +280,14 @@ mod tests {
             "/v2/ is mounted beside the layer"
         );
         assert!(routers.protected.has_routes());
+
+        // The registry documents itself in the server's one OpenAPI document.
+        assert!(with_registry
+            .openapi()
+            .paths
+            .paths
+            .contains_key("/v2/{name}/manifests/{reference}"));
+        assert!(!stock.openapi().paths.paths.contains_key("/v2/"));
     }
 
     #[test]
