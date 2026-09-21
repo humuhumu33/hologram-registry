@@ -667,7 +667,7 @@ async fn a_manifest_is_stored_byte_for_byte_and_checked_against_its_repository()
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     let value: serde_json::Value = serde_json::from_slice(&body(refused).await).expect("json");
     assert_eq!(value["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
-    assert_eq!(value["errors"][0]["detail"][0], layer_digest.as_str());
+    assert_eq!(value["errors"][0]["detail"], layer_digest.as_str());
 
     let garbage = send_body(
         &volume,
@@ -681,7 +681,7 @@ async fn a_manifest_is_stored_byte_for_byte_and_checked_against_its_repository()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_manifest_with_a_subject_says_so_and_one_over_the_cap_is_413() {
+async fn a_manifest_with_a_subject_says_so_and_one_over_the_cap_is_refused() {
     let volume = volume();
     let (_, subject, _) = seed(&volume.store);
     let manifest =
@@ -706,7 +706,11 @@ async fn a_manifest_with_a_subject_says_so_and_one_over_the_cap_is_413() {
         vec![b' '; (4 << 20) + 1],
     )
     .await;
-    assert_eq!(huge.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        huge.status(),
+        StatusCode::BAD_REQUEST,
+        "as the reference: 400, not 413"
+    );
     assert_eq!(error_code(huge).await, "MANIFEST_INVALID");
 }
 

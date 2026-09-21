@@ -212,6 +212,11 @@ impl OciError {
         .with_header(ALLOW, HeaderValue::from_static(allow))
     }
 
+    /// `BLOB_UPLOAD_UNKNOWN`, with the reference's detail (gate B).
+    pub fn upload_unknown() -> Self {
+        Self::new(ErrorCode::BlobUploadUnknown).with_detail(json!("blob upload unknown"))
+    }
+
     /// Answer with `message` instead of the code's own.
     #[must_use]
     pub fn with_message(mut self, message: &'static str) -> Self {
@@ -241,7 +246,7 @@ impl OciError {
                 "digest" => Self::new(ErrorCode::DigestInvalid).with_detail(json!(digest_fault(&value))),
                 "repository name" => Self::new(ErrorCode::NameInvalid).with_detail(json!(value)),
                 "tag" => Self::new(ErrorCode::TagInvalid).with_detail(json!(value)),
-                "upload id" => Self::new(ErrorCode::BlobUploadUnknown),
+                "upload id" => Self::upload_unknown(),
                 other => Self::internal(&format!("invalid {other}: {value:?}")),
             },
             OciStoreError::NotInRepository { repo, digest } => match context {
@@ -260,7 +265,7 @@ impl OciError {
                 }
                 Context::Blob | Context::Upload => Self::new(ErrorCode::BlobUnknown),
             },
-            OciStoreError::UnknownUpload(_) => Self::new(ErrorCode::BlobUploadUnknown),
+            OciStoreError::UnknownUpload(_) => Self::upload_unknown(),
             OciStoreError::DigestMismatch { claimed } => {
                 Self::new(ErrorCode::DigestInvalid).with_detail(json!(claimed))
             }
@@ -323,13 +328,24 @@ impl IntoResponse for OciError {
                 response
             }
             Some(code) => {
-                let mut entry = json!({ "code": code.as_str(), "message": message });
-                if !detail.is_null() {
-                    entry["detail"] = detail;
-                }
+                let entry = |detail: Value| {
+                    let mut entry = json!({ "code": code.as_str(), "message": message });
+                    if !detail.is_null() {
+                        entry["detail"] = detail;
+                    }
+                    entry
+                };
+                // The reference reports each missing blob as an error of its
+                // own, its digest in `detail` (gate B, `manifest-put-invalid`).
+                let entries: Vec<Value> = match detail {
+                    Value::Array(digests) if code == ErrorCode::ManifestBlobUnknown => {
+                        digests.into_iter().map(entry).collect()
+                    }
+                    other => vec![entry(other)],
+                };
                 // The reference's encoder ends the body with a newline; clients
                 // see it in Content-Length (gate B, every error).
-                let body = json!({ "errors": [entry] }).to_string() + "\n";
+                let body = json!({ "errors": entries }).to_string() + "\n";
                 let mut response = (status, body).into_response();
                 response
                     .headers_mut()

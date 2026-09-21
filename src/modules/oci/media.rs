@@ -35,23 +35,24 @@ pub fn plan(content_type: Option<&str>, bytes: &[u8]) -> Result<(String, Manifes
     if body.get("schemaVersion").and_then(Value::as_u64) != Some(2) {
         return Err(invalid("schemaVersion must be 2"));
     }
-    let declared = body.get("mediaType").and_then(Value::as_str);
+    // `Content-Type` decides, alone: the reference has no fallback to the
+    // body's `mediaType` or to its shape (gate B, `manifest-put-invalid`).
     let sent = content_type
         .map(|value| value.split(';').next().unwrap_or_default().trim())
-        .filter(|value| !value.is_empty());
-    let media_type = match (sent, declared) {
-        (Some(sent), Some(declared)) if sent != declared => {
-            return Err(invalid("mediaType does not match Content-Type"));
-        }
-        (Some(known), _) | (None, Some(known)) => known,
-        (None, None) if body.contains_key("manifests") => OCI_INDEX,
-        (None, None) => OCI_MANIFEST,
-    };
-    let kind = match media_type {
+        .unwrap_or_default();
+    let kind = match sent {
         DOCKER_MANIFEST | OCI_MANIFEST => LinkKind::Manifest,
         DOCKER_LIST | OCI_INDEX => LinkKind::Index,
-        _ => return Err(invalid("unsupported manifest media type")),
+        _ => {
+            return Err(OciError::new(ErrorCode::ManifestInvalid).with_detail(json!(format!(
+                "unsupported manifest media type and no default available: {sent}"
+            ))));
+        }
     };
+    let media_type = sent;
+    if body.get("mediaType").and_then(Value::as_str).is_some_and(|declared| declared != sent) {
+        return Err(invalid("mediaType does not match Content-Type"));
+    }
 
     let mut must_exist = Vec::new();
     if kind == LinkKind::Manifest {
@@ -70,11 +71,10 @@ pub fn plan(content_type: Option<&str>, bytes: &[u8]) -> Result<(String, Manifes
             }
         }
     } else {
-        // An index's children are read for their grammar and not required to
-        // be present: the reference is lenient here (scenario
-        // `index-missing-child`), and clients push indexes in either order.
+        // An index's children must be in this repository: the reference
+        // refuses an index with a missing child (gate B, `index-missing-child`).
         for child in array(body, "manifests")? {
-            descriptor_digest(child)?;
+            must_exist.push(descriptor_digest(child)?);
         }
     }
 
@@ -155,12 +155,12 @@ mod tests {
     }
 
     #[test]
-    fn an_index_does_not_require_its_children() {
+    fn an_index_requires_its_children() {
         let body = format!(r#"{{"schemaVersion":2,"manifests":[{{"digest":"{A}"}}]}}"#);
         for media_type in [OCI_INDEX, DOCKER_LIST] {
             let (_, plan) = plan(Some(media_type), body.as_bytes()).expect("plan");
             assert_eq!(plan.kind, LinkKind::Index);
-            assert!(plan.must_exist.is_empty());
+            assert_eq!(digests(&plan), [A]);
         }
     }
 
@@ -190,18 +190,14 @@ mod tests {
     }
 
     #[test]
-    fn the_media_type_comes_from_the_header_then_the_body_then_the_shape() {
-        let typed = format!(r#"{{"schemaVersion":2,"mediaType":"{OCI_INDEX}","manifests":[]}}"#);
-        assert_eq!(plan(None, typed.as_bytes()).expect("plan").0, OCI_INDEX);
-        let bare = br#"{"schemaVersion":2,"manifests":[]}"#;
-        assert_eq!(plan(None, bare).expect("plan").0, OCI_INDEX);
+    fn the_media_type_comes_from_the_header_alone() {
         let bare = br#"{"schemaVersion":2,"layers":[]}"#;
-        assert_eq!(plan(None, bare).expect("plan").0, OCI_MANIFEST);
         let with_parameter = format!("{OCI_MANIFEST}; charset=utf-8");
-        assert_eq!(
-            plan(Some(&with_parameter), bare).expect("plan").0,
-            OCI_MANIFEST
-        );
+        assert_eq!(plan(Some(&with_parameter), bare).expect("plan").0, OCI_MANIFEST);
+        for missing in [None, Some(""), Some("application/json")] {
+            let error = plan(missing, bare).expect_err("no fallback");
+            assert_eq!(error.code(), Some(ErrorCode::ManifestInvalid));
+        }
     }
 
     #[test]

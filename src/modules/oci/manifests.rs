@@ -48,6 +48,14 @@ pub async fn get(
             }
             other => OciError::from_store(other, Context::Manifest),
         })?;
+    // A conditional request is answered first, whatever `Accept` says (gate
+    // B, `manifest-read`): a proxy polling a tag it holds sends no `Accept`.
+    if not_modified(headers, &manifest.digest) {
+        let mut response = Response::new(Body::empty());
+        stamp_digest(response.headers_mut(), &manifest.digest);
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        return Ok(response);
+    }
     // The reference serves an OCI manifest or index only to a client whose
     // `Accept` names that type; `*/*` is not enough (gate B, `manifest-read`).
     // Docker types are served to anyone.
@@ -90,7 +98,7 @@ pub async fn get(
 ///
 /// # Errors
 ///
-/// `MANIFEST_INVALID` (413 over 4 MiB); `DIGEST_INVALID` when the path names a
+/// `MANIFEST_INVALID` (also over 4 MiB); `DIGEST_INVALID` when the path names a
 /// digest the body does not hash to; `MANIFEST_BLOB_UNKNOWN` with the missing
 /// digests in `detail`.
 pub async fn put(
@@ -142,8 +150,10 @@ async fn whole(body: Body) -> Result<Vec<u8>, OciError> {
     while let Some(piece) = stream.next().await {
         let piece = piece.map_err(|_| OciError::new(ErrorCode::ManifestInvalid))?;
         if bytes.len() + piece.len() > MANIFEST_MAX {
+            // 400, and in these words, as the reference answers it; the OCI
+            // text suggests 413 (gate B, `manifest-put-invalid`).
             return Err(OciError::new(ErrorCode::ManifestInvalid)
-                .with_status(StatusCode::PAYLOAD_TOO_LARGE));
+                .with_detail(serde_json::json!("http: request body too large")));
         }
         bytes.extend_from_slice(&piece);
     }

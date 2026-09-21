@@ -144,6 +144,10 @@ pub fn parse(method: &Method, rest: &str) -> Result<Route, OciError> {
     }
     if let Some(name) = rest.strip_suffix("/blobs/uploads/") {
         let repo = repo(name)?;
+        // The reference routes this to the upload with an empty id (gate B).
+        if [Method::GET, Method::HEAD, Method::PATCH, Method::PUT, Method::DELETE].contains(method) {
+            return Err(OciError::upload_unknown());
+        }
         return pick(method, ALLOW_POST, |method| {
             (method == Method::POST).then_some(Route::UploadStart { repo })
         });
@@ -356,7 +360,6 @@ mod tests {
     fn a_wrong_method_is_405_with_allow() {
         for (method, rest, allow) in [
             (Method::DELETE, "foo/tags/list".to_owned(), "GET"),
-            (Method::GET, "foo/blobs/uploads/".to_owned(), "POST"),
             (Method::POST, "foo/manifests/latest".to_owned(), "DELETE, GET, HEAD, PUT"),
             (Method::PUT, format!("foo/blobs/sha256:{HEX}"), "DELETE, GET, HEAD"),
             (

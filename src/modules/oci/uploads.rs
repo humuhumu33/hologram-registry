@@ -95,7 +95,9 @@ pub async fn start(
     query: Option<&str>,
     body: Body,
 ) -> Result<Response, OciError> {
-    if let Some(digest) = digest_param(query, "mount")? {
+    // A `mount` that is not a digest is ignored, as the reference ignores it
+    // (gate B, `mount`): the client gets an ordinary session.
+    if let Some(digest) = digest_param(query, "mount").ok().flatten() {
         let from = query_param(query, "from").and_then(|name| RepoName::parse(&name).ok());
         if let Some(from) = from {
             if let Some(response) = mount(&store, &repo, &from, &digest).await? {
@@ -201,7 +203,9 @@ pub async fn put(
     body: Body,
 ) -> Result<Response, OciError> {
     let claimed =
-        digest_param(query, "digest")?.ok_or_else(|| OciError::new(ErrorCode::DigestInvalid))?;
+        digest_param(query, "digest")?.ok_or_else(|| {
+            OciError::new(ErrorCode::DigestInvalid).with_detail(serde_json::json!("digest missing"))
+        })?;
     let received = session_of(&store, &repo, &id).await?;
     stream_into(&store, &id, received, body).await?;
     finish(store, &repo, id, claimed).await

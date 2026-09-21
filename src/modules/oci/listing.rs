@@ -88,7 +88,13 @@ pub async fn tags(
     let limit = n.unwrap_or(TAGS_DEFAULT);
     let name = repo.clone();
     let found = blocking(Context::Tags, move || {
-        store.tags_page(&name, last.as_deref(), limit.saturating_add(1))
+        let tags = store.tags_page(&name, last.as_deref(), limit.saturating_add(1))?;
+        // The reference knows a repository by its manifests: one that holds
+        // blobs only is `NAME_UNKNOWN` here (gate B, every push scenario).
+        if tags.is_empty() && last.is_none() && !holds_a_manifest(&store, &name)? {
+            return Err(OciStoreError::UnknownRepository(name.as_str().to_owned()));
+        }
+        Ok(tags)
     })
     .await?;
     let (tags, more) = trim(found, limit);
@@ -102,6 +108,20 @@ pub async fn tags(
         "application/json",
         next,
     ))
+}
+
+fn holds_a_manifest(store: &OciStore, repo: &RepoName) -> Result<bool, OciStoreError> {
+    let mut after = None;
+    loop {
+        let page = store.links_page(repo, after.as_ref(), 1000)?;
+        if page.iter().any(|(_, link)| link.kind != crate::oci_store::LinkKind::Blob) {
+            return Ok(true);
+        }
+        match page.last() {
+            Some((digest, _)) if page.len() == 1000 => after = Some(digest.clone()),
+            _ => return Ok(false),
+        }
+    }
 }
 
 /// Route 2.
