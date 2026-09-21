@@ -39,6 +39,11 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      # Spike only. aws-lc-sys (pulled by rekindle-aead) needs NASM on Windows and a
+      # clean runner has none: the first run failed here. The prebuilt objects let the
+      # rest of the Windows questions be answered. The real fix is the optional-aead
+      # patch in third_party/kappa/README.md, after which aws-lc leaves the graph.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
