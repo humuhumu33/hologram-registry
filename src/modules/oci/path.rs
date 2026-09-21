@@ -128,9 +128,8 @@ fn percent_decode(raw: &str, slash_allowed: bool) -> Option<String> {
 /// the grammar; 405 with `Allow` for a route that does not take `method`.
 pub fn parse(method: &Method, rest: &str) -> Result<Route, OciError> {
     if rest.is_empty() {
-        return pick(method, ALLOW_GET, |method| {
-            (method == Method::GET).then_some(Route::Base)
-        });
+        // The reference's base handler takes every method (gate B, `base`).
+        return Ok(Route::Base);
     }
     if rest == "_catalog" {
         return pick(method, ALLOW_GET, |method| {
@@ -350,6 +349,9 @@ mod tests {
 
     #[test]
     fn base_and_catalogue() {
+        // The reference's base handler takes every method.
+        assert_eq!(parse(&Method::POST, "").expect("base"), Route::Base);
+        assert_eq!(parse(&Method::OPTIONS, "").expect("base"), Route::Base);
         assert_eq!(get("").expect("base"), Route::Base);
         assert_eq!(get("_catalog").expect("catalogue"), Route::Catalog);
     }
@@ -357,7 +359,6 @@ mod tests {
     #[test]
     fn a_wrong_method_is_405_with_allow() {
         for (method, rest, allow) in [
-            (Method::POST, String::new(), "GET"),
             (Method::DELETE, "foo/tags/list".to_owned(), "GET"),
             (Method::GET, "foo/blobs/uploads/".to_owned(), "POST"),
             (Method::POST, "foo/manifests/latest".to_owned(), "DELETE, GET, HEAD, PUT"),

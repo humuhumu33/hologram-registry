@@ -116,10 +116,11 @@ async fn envelope(request: Request, next: Next) -> Response {
 
 /// `/v2` is not the base route; the reference's router redirects to it.
 async fn without_the_slash() -> Response {
-    let mut response = StatusCode::MOVED_PERMANENTLY.into_response();
-    response
-        .headers_mut()
-        .insert(LOCATION, HeaderValue::from_static("/v2/"));
+    // Byte for byte what the reference's router sends (gate B, `base`).
+    let mut response = (StatusCode::MOVED_PERMANENTLY, "<a href=\"/v2/\">Moved Permanently</a>.\n\n").into_response();
+    let headers = response.headers_mut();
+    headers.insert(LOCATION, HeaderValue::from_static("/v2/"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
     response
 }
 

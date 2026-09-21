@@ -3,7 +3,7 @@
 use super::error::{Context, ErrorCode, OciError};
 use super::media;
 use super::respond::{not_modified, stamp_digest};
-use crate::oci_store::{OciStore, Reference, RepoName};
+use crate::oci_store::{OciStore, OciStoreError, Reference, RepoName};
 use axum::body::Body;
 use axum::http::header::{HeaderName, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -32,10 +32,41 @@ pub async fn get(
     headers: &HeaderMap,
     head: bool,
 ) -> Result<Response, OciError> {
+    let asked = reference.clone();
+    let name = repo.clone();
     let manifest = tokio::task::spawn_blocking(move || store.manifest_get(&repo, &reference))
         .await
         .map_err(|error| OciError::internal(&error))?
-        .map_err(|error| OciError::from_store(error, Context::Manifest))?;
+        .map_err(|error| match error {
+            // In the reference's words (gate B, `errors-read`).
+            OciStoreError::NotInRepository { .. } | OciStoreError::UnknownRepository(_) => {
+                let detail = match &asked {
+                    Reference::Tag(tag) => format!("unknown tag={tag}"),
+                    Reference::Digest(digest) => format!("unknown manifest name={name} revision={digest}"),
+                };
+                OciError::new(ErrorCode::ManifestUnknown).with_detail(serde_json::json!(detail))
+            }
+            other => OciError::from_store(other, Context::Manifest),
+        })?;
+    // The reference serves an OCI manifest or index only to a client whose
+    // `Accept` names that type; `*/*` is not enough (gate B, `manifest-read`).
+    // Docker types are served to anyone.
+    let refusal = match manifest.media_type.as_str() {
+        media::OCI_MANIFEST => Some("OCI manifest found, but accept header does not support OCI manifests"),
+        media::OCI_INDEX => Some("OCI index found, but accept header does not support OCI indexes"),
+        _ => None,
+    };
+    if let Some(message) = refusal {
+        let accepted = headers
+            .get_all(axum::http::header::ACCEPT)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|entry| entry.split(';').next().unwrap_or_default().trim() == manifest.media_type);
+        if !accepted {
+            return Err(OciError::new(ErrorCode::ManifestUnknown).with_message(message));
+        }
+    }
 
     let mut response = Response::new(Body::empty());
     let out = response.headers_mut();

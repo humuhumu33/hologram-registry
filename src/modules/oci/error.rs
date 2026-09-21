@@ -198,9 +198,25 @@ impl OciError {
         }))
     }
 
-    /// A known path with a method it does not take.
+    /// A known path with a method it does not take. Like the plain 404, the
+    /// reference answers this from its router, in plain text, with `Allow`
+    /// (gate B, `unknown-route`).
     pub fn wrong_method(allow: &'static str) -> Self {
-        Self::new(ErrorCode::Unsupported).with_header(ALLOW, HeaderValue::from_static(allow))
+        Self(Box::new(Refusal {
+            code: None,
+            status: Some(StatusCode::METHOD_NOT_ALLOWED),
+            message: Cow::Borrowed("Method not allowed\n"),
+            detail: Value::Null,
+            headers: HeaderMap::new(),
+        }))
+        .with_header(ALLOW, HeaderValue::from_static(allow))
+    }
+
+    /// Answer with `message` instead of the code's own.
+    #[must_use]
+    pub fn with_message(mut self, message: &'static str) -> Self {
+        self.0.message = Cow::Borrowed(message);
+        self
     }
 
     /// An internal failure. The cause is logged here and never sent.
@@ -222,7 +238,7 @@ impl OciError {
     pub fn from_store(error: OciStoreError, context: Context) -> Self {
         match error {
             OciStoreError::Invalid { what, value } => match what {
-                "digest" => Self::new(ErrorCode::DigestInvalid).with_detail(json!(value)),
+                "digest" => Self::new(ErrorCode::DigestInvalid).with_detail(json!(digest_fault(&value))),
                 "repository name" => Self::new(ErrorCode::NameInvalid).with_detail(json!(value)),
                 "tag" => Self::new(ErrorCode::TagInvalid).with_detail(json!(value)),
                 "upload id" => Self::new(ErrorCode::BlobUploadUnknown),
@@ -263,6 +279,22 @@ impl OciError {
                 Self::internal(&error)
             }
         }
+    }
+}
+
+/// Why a digest is outside the grammar, in the reference's words (gate B,
+/// `errors-read`).
+fn digest_fault(value: &str) -> &'static str {
+    match value.split_once(':') {
+        Some((algorithm, hex)) if ["sha256", "sha512", "blake3"].contains(&algorithm) => {
+            if hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                "invalid checksum digest length"
+            } else {
+                "invalid checksum digest format"
+            }
+        }
+        Some(_) => "unsupported digest algorithm",
+        None => "invalid checksum digest format",
     }
 }
 
@@ -478,10 +510,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wrong_method_names_the_right_ones() {
+    async fn a_wrong_method_names_the_right_ones_in_plain_text() {
         let (status, headers, body) = parts(OciError::wrong_method("GET, HEAD")).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(headers[ALLOW], "GET, HEAD");
-        assert_eq!(body["errors"][0]["code"], "UNSUPPORTED");
+        assert_eq!(headers[CONTENT_TYPE], "text/plain; charset=utf-8");
+        assert!(body.is_null(), "the reference's router answers before the envelope exists");
+    }
+
+    #[test]
+    fn a_digest_fault_is_named_in_the_references_words() {
+        assert_eq!(digest_fault("sha256:abc"), "invalid checksum digest length");
+        assert_eq!(digest_fault("sha256:xyz"), "invalid checksum digest format");
+        assert_eq!(digest_fault("md5:d41d8cd98f00b204e9800998ecf8427e"), "unsupported digest algorithm");
     }
 }

@@ -96,6 +96,14 @@ async fn send_body(
     body: Vec<u8>,
 ) -> Response {
     let mut request = Request::builder().method(method).uri(path);
+    // The reference serves an OCI manifest only to a client that asks for the
+    // type, so the tests ask, as every real client does.
+    let asks = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("accept"));
+    if path.contains("/manifests/") && !asks {
+        request = request.header("accept", MANIFEST_TYPE);
+    }
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
@@ -301,6 +309,40 @@ async fn a_manifest_by_tag_and_by_digest() {
         assert_eq!(header(&head, "content-length"), bytes.len().to_string());
         assert!(body(head).await.is_empty());
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oci_manifest_is_served_only_to_a_client_that_asks_for_the_type() {
+    let volume = volume();
+    seed(&volume.store);
+    for accept in [
+        "*/*",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ] {
+        let response = send(
+            &volume,
+            "GET",
+            "/v2/team/app/manifests/v1",
+            &[("accept", accept)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{accept}");
+        let value: serde_json::Value = serde_json::from_slice(&body(response).await).expect("json");
+        assert_eq!(value["errors"][0]["code"], "MANIFEST_UNKNOWN");
+        assert_eq!(
+            value["errors"][0]["message"],
+            "OCI manifest found, but accept header does not support OCI manifests"
+        );
+    }
+    let listed = format!("application/json, {MANIFEST_TYPE};q=0.9");
+    let response = send(
+        &volume,
+        "GET",
+        "/v2/team/app/manifests/v1",
+        &[("accept", &listed)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -934,7 +976,7 @@ mod served {
         };
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{authorization}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{authorization}Content-Type: {content_type}\r\nContent-Length: {}\r\nAccept: application/vnd.oci.image.manifest.v1+json\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .expect("send");
@@ -976,7 +1018,7 @@ mod served {
             .expect("timeout");
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nExpect: 100-continue\r\nAccept: application/vnd.oci.image.manifest.v1+json\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .expect("send");
