@@ -8,10 +8,13 @@
 //! No Kappa type is named here. Storage is `crate::oci_store`.
 
 mod blobs;
+mod body;
 pub mod error;
 mod manifests;
+mod media;
 pub mod path;
 mod respond;
+mod uploads;
 
 use crate::app::AppState;
 use crate::module::{LiveModule, ModuleDescriptor};
@@ -19,13 +22,13 @@ use crate::oci_store::OciStore;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use error::{ErrorCode, OciError};
-use path::{BlobVerb, ManifestVerb, Route};
+use path::{BlobVerb, ManifestVerb, Route, UploadVerb};
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -97,15 +100,15 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
 
 /// Answer one request under `/v2/` from `store`.
 pub async fn handle(store: Arc<OciStore>, request: Request) -> Response {
-    // The body is not `Sync`, so nothing borrowed from the request may live
-    // across an await. The read path needs the head only.
-    let (head, _body) = request.into_parts();
+    // The body is not `Sync`, so nothing borrowed from the whole request may
+    // live across an await: the head is borrowed, the body is moved.
+    let (head, body) = request.into_parts();
     let rest = head.uri.path().strip_prefix("/v2/").unwrap_or_default();
     let route = path::decode(rest)
         .ok_or_else(OciError::unknown_route)
         .and_then(|rest| path::parse(&head.method, &rest));
     match route {
-        Ok(route) => serve(store, route, &head.headers)
+        Ok(route) => serve(store, route, &head, body)
             .await
             .unwrap_or_else(IntoResponse::into_response),
         Err(error) => error.into_response(),
@@ -115,8 +118,10 @@ pub async fn handle(store: Arc<OciStore>, request: Request) -> Response {
 async fn serve(
     store: Arc<OciStore>,
     route: Route,
-    headers: &HeaderMap,
+    head: &axum::http::request::Parts,
+    body: Body,
 ) -> Result<Response, OciError> {
+    let (headers, query) = (&head.headers, head.uri.query());
     match route {
         Route::Base => Ok(json(StatusCode::OK, "{}")),
         Route::Options { allow } => {
@@ -136,14 +141,24 @@ async fn serve(
             reference,
             verb: verb @ (ManifestVerb::Get | ManifestVerb::Head),
         } => manifests::get(store, repo, reference, headers, verb == ManifestVerb::Head).await,
-        // Push, delete, listing and referrers arrive with the phases that
-        // build them (P4, P7). Until then the path is known and refused.
+        Route::Manifest {
+            repo,
+            reference,
+            verb: ManifestVerb::Put,
+        } => manifests::put(store, repo, reference, headers, body).await,
+        Route::UploadStart { repo } => uploads::start(store, repo, query, body).await,
+        Route::Upload { repo, id, verb } => match verb {
+            UploadVerb::Status => uploads::status(store, repo, id).await,
+            UploadVerb::Patch => uploads::patch(store, repo, id, headers, body).await,
+            UploadVerb::Put => uploads::put(store, repo, id, query, body).await,
+            UploadVerb::Delete => uploads::cancel(store, repo, id).await,
+        },
+        // Delete, listing and referrers arrive with the phase that builds
+        // them (P7). Until then the path is known and refused.
         Route::Catalog
         | Route::TagsList { .. }
         | Route::Manifest { .. }
         | Route::Blob { .. }
-        | Route::UploadStart { .. }
-        | Route::Upload { .. }
         | Route::Referrers { .. } => Err(OciError::new(ErrorCode::Unsupported)),
     }
 }

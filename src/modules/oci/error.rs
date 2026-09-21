@@ -149,6 +149,8 @@ pub struct OciError(Box<Refusal>);
 struct Refusal {
     /// `None` is the one answer without an envelope: a path no route claims.
     code: Option<ErrorCode>,
+    /// For the one code that is sent with two statuses.
+    status: Option<StatusCode>,
     message: Cow<'static, str>,
     detail: Value,
     headers: HeaderMap,
@@ -158,6 +160,7 @@ impl OciError {
     pub fn new(code: ErrorCode) -> Self {
         Self(Box::new(Refusal {
             code: Some(code),
+            status: None,
             message: Cow::Borrowed(code.default_message()),
             detail: Value::Null,
             headers: HeaderMap::new(),
@@ -167,6 +170,13 @@ impl OciError {
     #[must_use]
     pub fn with_detail(mut self, detail: Value) -> Self {
         self.0.detail = detail;
+        self
+    }
+
+    /// Answer with `status` instead of the code's own.
+    #[must_use]
+    pub fn with_status(mut self, status: StatusCode) -> Self {
+        self.0.status = Some(status);
         self
     }
 
@@ -181,6 +191,7 @@ impl OciError {
     pub fn unknown_route() -> Self {
         Self(Box::new(Refusal {
             code: None,
+            status: None,
             message: Cow::Borrowed("404 page not found\n"),
             detail: Value::Null,
             headers: HeaderMap::new(),
@@ -203,7 +214,9 @@ impl OciError {
     }
 
     pub fn status(&self) -> StatusCode {
-        self.0.code.map_or(StatusCode::NOT_FOUND, ErrorCode::status)
+        self.0
+            .status
+            .unwrap_or_else(|| self.0.code.map_or(StatusCode::NOT_FOUND, ErrorCode::status))
     }
 
     pub fn from_store(error: OciStoreError, context: Context) -> Self {
@@ -261,6 +274,7 @@ impl IntoResponse for OciError {
             message,
             detail,
             headers,
+            status: _,
         } = *self.0;
         let mut response = match code {
             None => {

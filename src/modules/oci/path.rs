@@ -77,9 +77,25 @@ const ALLOW_MANIFEST: &str = "DELETE, GET, HEAD, PUT";
 const ALLOW_BLOB: &str = "DELETE, GET, HEAD";
 const ALLOW_UPLOAD: &str = "DELETE, GET, HEAD, PATCH, PUT";
 
-/// Undo percent-encoding once. `None` when the path hides a slash inside a
-/// component (`%2F`), or is not valid encoding or UTF-8: such a path is no route.
+/// Undo a path's percent-encoding once. `None` when the path hides a slash
+/// inside a component (`%2F`), or is not valid encoding or UTF-8: such a path
+/// is no route.
 pub fn decode(raw: &str) -> Option<String> {
+    percent_decode(raw, false)
+}
+
+/// The value of `name` in a query string, decoded. A repository name in
+/// `from=` arrives as `myorg%2Fother`, so a slash is allowed here.
+pub fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (key == name)
+            .then(|| percent_decode(value, true))
+            .flatten()
+    })
+}
+
+fn percent_decode(raw: &str, slash_allowed: bool) -> Option<String> {
     if !raw.contains('%') {
         return Some(raw.to_owned());
     }
@@ -90,7 +106,7 @@ pub fn decode(raw: &str) -> Option<String> {
         if bytes[at] == b'%' {
             let hex = raw.get(at + 1..at + 3)?;
             let byte = u8::from_str_radix(hex, 16).ok()?;
-            if byte == b'/' {
+            if byte == b'/' && !slash_allowed {
                 return None;
             }
             out.push(byte);
@@ -155,8 +171,17 @@ pub fn parse(method: &Method, rest: &str) -> Result<Route, OciError> {
     }
     if let Some(name) = head.strip_suffix("/manifests") {
         let repo = repo(name)?;
-        let reference =
-            Reference::parse(tail).map_err(|error| OciError::from_store(error, Context::Manifest))?;
+        // A tag outside the grammar is no route at all, as it is for the
+        // reference's router: the OCI conformance suite asks for the tag
+        // `.INVALID_MANIFEST_NAME` and requires 404. A malformed digest is
+        // `DIGEST_INVALID`; it is never read as a tag.
+        let reference = Reference::parse(tail).map_err(|error| {
+            if tail.contains(':') {
+                OciError::from_store(error, Context::Manifest)
+            } else {
+                OciError::unknown_route()
+            }
+        })?;
         return pick(method, ALLOW_MANIFEST, |method| {
             let verb = match *method {
                 Method::GET => ManifestVerb::Get,
@@ -381,11 +406,30 @@ mod tests {
     }
 
     #[test]
+    fn a_tag_outside_the_grammar_is_404_for_every_method() {
+        for method in [Method::GET, Method::HEAD, Method::PUT, Method::DELETE] {
+            let error =
+                parse(&method, "myorg/myrepo/manifests/.INVALID_MANIFEST_NAME").expect_err("tag");
+            assert_eq!((error.code(), error.status()), (None, StatusCode::NOT_FOUND));
+        }
+    }
+
+    #[test]
     fn what_is_no_route() {
         for rest in ["foo", "foo/", "manifests/latest", "tags/list", "foo/bar/baz", "foo/blobs/"] {
             let error = get(rest).expect_err(rest);
             assert_eq!((error.code(), error.status()), (None, StatusCode::NOT_FOUND), "{rest}");
         }
+    }
+
+    #[test]
+    fn query_values_are_decoded_and_may_hold_a_slash() {
+        let query = Some("mount=sha256%3Aabc&from=myorg%2Fother&empty");
+        assert_eq!(query_param(query, "mount").as_deref(), Some("sha256:abc"));
+        assert_eq!(query_param(query, "from").as_deref(), Some("myorg/other"));
+        assert_eq!(query_param(query, "empty").as_deref(), Some(""));
+        assert_eq!(query_param(query, "digest"), None);
+        assert_eq!(query_param(None, "digest"), None);
     }
 
     #[test]

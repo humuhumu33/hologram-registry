@@ -13,7 +13,6 @@ on:
       - "apps/registry/**"
       - "third_party/kappa/**"
       - "tests/oci_*.rs"
-      - "tests/support/oci_*.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/gates.yml"
@@ -23,29 +22,27 @@ permissions:
 
 jobs:
   gate-a:
-    name: Gate A · OCI conformance (pull)
+    name: Gate A · OCI conformance (pull, push)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # Reported, not blocking, until the pull category has been green once in
-    # CI. Then this line goes and pull blocks (plan, P3 task 6).
+    # Reported, not blocking, until both categories have been green once in
+    # CI. Then this line goes and they block (plan, P3 task 6 and P4 exit).
+    # While it is here a red suite still shows a green run: read the summary.
     continue-on-error: true
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       # opencontainers/distribution-spec v1.1.1, by digest.
       CONFORMANCE_IMAGE: ghcr.io/opencontainers/distribution-spec/conformance@sha256:609201aab0905b1e90ded490e5f0dbaadc9a4bef98aca4cd38ff308f588ed27a
-      OCI_NAMESPACE: myorg/myrepo
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
         with:
           key: gates
-      - name: Build the server and the seed helper
-        run: cargo build --locked --features oci --bin hologram --bin oci_seed
-      - name: Seed one image through the store adapter
-        # The suite's own setup pushes, and push is P4. Until then the image it
-        # reads is put there first; its three variables name it.
+      - name: Build the server
+        run: cargo build --locked --features oci --bin hologram
+      - name: Write the configuration
         run: |
           mkdir -p "$RUNNER_TEMP/reg/config" "$RUNNER_TEMP/report"
           chmod 0777 "$RUNNER_TEMP/report"
@@ -64,7 +61,6 @@ jobs:
           [modules]
           enabled = ["dev.hologram.live.system", "dev.hologram.live.oci"]
           EOF
-          ./target/debug/oci_seed "$RUNNER_TEMP/reg/data" "$OCI_NAMESPACE" conformance | tee -a "$GITHUB_ENV"
       - name: Start the server
         run: |
           ./target/debug/hologram --config "$RUNNER_TEMP/reg/config/live.toml" serve > "$RUNNER_TEMP/report/server.log" 2>&1 &
@@ -74,21 +70,31 @@ jobs:
           done
           cat "$RUNNER_TEMP/report/server.log"
           exit 1
-      - name: OCI conformance, pull category
+      - name: OCI conformance, pull and push categories
+        # The suite pushes what it then pulls, so nothing is seeded.
         run: |
+          set -o pipefail
           docker run --rm --network host \
             -v "$RUNNER_TEMP/report:/report" \
             -e OCI_ROOT_URL=http://127.0.0.1:5000 \
-            -e OCI_NAMESPACE \
+            -e OCI_NAMESPACE=myorg/myrepo \
             -e OCI_CROSSMOUNT_NAMESPACE=myorg/other \
             -e OCI_TEST_PULL=1 \
-            -e OCI_TEST_PUSH=0 \
+            -e OCI_TEST_PUSH=1 \
             -e OCI_TEST_CONTENT_DISCOVERY=0 \
             -e OCI_TEST_CONTENT_MANAGEMENT=0 \
             -e OCI_HIDE_SKIPPED_WORKFLOWS=1 \
             -e OCI_REPORT_DIR=/report \
-            -e OCI_TAG_NAME -e OCI_BLOB_DIGEST -e OCI_MANIFEST_DIGEST \
-            "$CONFORMANCE_IMAGE"
+            "$CONFORMANCE_IMAGE" | tee "$RUNNER_TEMP/report/conformance.log"
+      - name: Verdict
+        if: always()
+        run: |
+          {
+            echo '### Gate A · OCI conformance (pull, push)'
+            echo '```'
+            sed 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/report/conformance.log" | grep -E 'Ran [0-9]+ of|Passed|\[FAIL\]' || echo 'no verdict: the suite did not run'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

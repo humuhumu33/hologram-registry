@@ -79,13 +79,23 @@ fn volume() -> Volume {
 }
 
 async fn send(volume: &Volume, method: &str, path: &str, headers: &[(&str, &str)]) -> Response {
+    send_body(volume, method, path, headers, Vec::new()).await
+}
+
+async fn send_body(
+    volume: &Volume,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> Response {
     let mut request = Request::builder().method(method).uri(path);
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
     handle(
         volume.store.clone(),
-        request.body(Body::empty()).expect("request"),
+        request.body(Body::from(body)).expect("request"),
     )
     .await
 }
@@ -331,6 +341,312 @@ async fn a_wrong_method_and_an_unknown_path() {
     );
 }
 
+// ---- The write path ----------------------------------------------------------
+
+/// `POST`, then the location it answered with.
+async fn open_upload(volume: &Volume, repo: &str) -> String {
+    let response = send(volume, "POST", &format!("/v2/{repo}/blobs/uploads/"), &[]).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(header(&response, "range"), "0-0");
+    assert_eq!(header(&response, "content-length"), "0");
+    let location = header(&response, "location").to_owned();
+    assert_eq!(
+        location,
+        format!(
+            "/v2/{repo}/blobs/uploads/{}",
+            header(&response, "docker-upload-uuid")
+        )
+    );
+    location
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_pushed_in_chunks_reads_back() {
+    let volume = volume();
+    let bytes = layer();
+    let digest = Digest::sha256_of(&bytes);
+    let location = open_upload(&volume, "team/app").await;
+    let (first, second) = bytes.split_at(1 << 20);
+
+    // Without Content-Range, as docker sends it.
+    let patched = send_body(&volume, "PATCH", &location, &[], first.to_vec()).await;
+    assert_eq!(patched.status(), StatusCode::ACCEPTED);
+    assert_eq!(header(&patched, "range"), "0-1048575");
+    assert_eq!(header(&patched, "location"), location);
+
+    // A chunk that does not start where the upload stands is refused, and told where it stands.
+    let stale = send_body(
+        &volume,
+        "PATCH",
+        &location,
+        &[("content-range", "0-9")],
+        vec![0; 10],
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(header(&stale, "range"), "0-1048575");
+
+    let status = send(&volume, "GET", &location, &[]).await;
+    assert_eq!(status.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&status, "range"), "0-1048575");
+
+    // With Content-Range, as the OCI specification writes it.
+    let range = format!("1048576-{}", bytes.len() - 1);
+    let patched = send_body(
+        &volume,
+        "PATCH",
+        &location,
+        &[("content-range", &range)],
+        second.to_vec(),
+    )
+    .await;
+    assert_eq!(patched.status(), StatusCode::ACCEPTED);
+
+    let closed = send(&volume, "PUT", &format!("{location}?digest={digest}"), &[]).await;
+    assert_eq!(closed.status(), StatusCode::CREATED);
+    assert_eq!(
+        header(&closed, "location"),
+        format!("/v2/team/app/blobs/{digest}")
+    );
+    assert_eq!(header(&closed, "docker-content-digest"), digest.as_str());
+
+    let pulled = send(&volume, "GET", &format!("/v2/team/app/blobs/{digest}"), &[]).await;
+    assert_eq!(body(pulled).await, bytes);
+    let gone = send(&volume, "GET", &location, &[]).await;
+    assert_eq!(error_code(gone).await, "BLOB_UPLOAD_UNKNOWN");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_pushed_in_one_request_and_one_closed_with_its_last_chunk() {
+    let volume = volume();
+    let bytes = layer();
+    let digest = Digest::sha256_of(&bytes);
+    let monolithic = send_body(
+        &volume,
+        "POST",
+        &format!("/v2/one/shot/blobs/uploads/?digest={digest}"),
+        &[],
+        bytes.clone(),
+    )
+    .await;
+    assert_eq!(monolithic.status(), StatusCode::CREATED);
+    assert_eq!(
+        header(&monolithic, "location"),
+        format!("/v2/one/shot/blobs/{digest}")
+    );
+
+    let location = open_upload(&volume, "two/steps").await;
+    let encoded = digest.as_str().replace(':', "%3A");
+    let closed = send_body(
+        &volume,
+        "PUT",
+        &format!("{location}?digest={encoded}"),
+        &[],
+        bytes.clone(),
+    )
+    .await;
+    assert_eq!(closed.status(), StatusCode::CREATED);
+    for repo in ["one/shot", "two/steps"] {
+        let head = send(&volume, "HEAD", &format!("/v2/{repo}/blobs/{digest}"), &[]).await;
+        assert_eq!(head.status(), StatusCode::OK, "{repo}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_digest_the_bytes_do_not_hash_to_is_refused_and_nothing_is_kept() {
+    let volume = volume();
+    let wrong = Digest::sha256_of(b"something else");
+    let location = open_upload(&volume, "team/app").await;
+    let closed = send_body(
+        &volume,
+        "PUT",
+        &format!("{location}?digest={wrong}"),
+        &[],
+        b"the bytes".to_vec(),
+    )
+    .await;
+    assert_eq!(closed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(closed).await, "DIGEST_INVALID");
+    let absent = send(&volume, "HEAD", &format!("/v2/team/app/blobs/{wrong}"), &[]).await;
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+    let location = open_upload(&volume, "team/app").await;
+    let missing = send(&volume, "PUT", &location, &[]).await;
+    assert_eq!(error_code(missing).await, "DIGEST_INVALID");
+    let malformed = send(
+        &volume,
+        "PUT",
+        &format!("{location}?digest=sha256:abc"),
+        &[],
+    )
+    .await;
+    assert_eq!(error_code(malformed).await, "DIGEST_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_cannot_reach_a_blob_the_source_does_not_link() {
+    let volume = volume();
+    let (digest, _, _) = seed(&volume.store);
+
+    let mounted = send(
+        &volume,
+        "POST",
+        &format!("/v2/other/app/blobs/uploads/?mount={digest}&from=team%2Fapp"),
+        &[],
+    )
+    .await;
+    assert_eq!(mounted.status(), StatusCode::CREATED);
+    assert_eq!(
+        header(&mounted, "location"),
+        format!("/v2/other/app/blobs/{digest}")
+    );
+    let head = send(
+        &volume,
+        "HEAD",
+        &format!("/v2/other/app/blobs/{digest}"),
+        &[],
+    )
+    .await;
+    assert_eq!(head.status(), StatusCode::OK);
+
+    // The blob exists in the store. Neither of these sources links it, so
+    // neither mount may succeed: each opens an ordinary upload instead.
+    for query in [
+        format!("mount={digest}&from=never%2Fseen"),
+        format!("mount={digest}"),
+    ] {
+        let response = send(
+            &volume,
+            "POST",
+            &format!("/v2/thief/app/blobs/uploads/?{query}"),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{query}");
+        let head = send(
+            &volume,
+            "HEAD",
+            &format!("/v2/thief/app/blobs/{digest}"),
+            &[],
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::NOT_FOUND, "{query}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_belongs_to_its_repository_and_can_be_abandoned() {
+    let volume = volume();
+    let location = open_upload(&volume, "team/app").await;
+    let elsewhere = location.replace("team/app", "other/app");
+    let response = send(&volume, "GET", &elsewhere, &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(response).await, "BLOB_UPLOAD_UNKNOWN");
+
+    let cancelled = send(&volume, "DELETE", &location, &[]).await;
+    assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+    let again = send(&volume, "DELETE", &location, &[]).await;
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manifest_is_stored_byte_for_byte_and_checked_against_its_repository() {
+    let volume = volume();
+    let (layer_digest, _, _) = seed(&volume.store);
+    // Odd spacing on purpose: what comes back must be exactly what went in.
+    let manifest = format!(
+        "{{ \"schemaVersion\": 2,\n\t\"mediaType\": \"{MANIFEST_TYPE}\",\n \"layers\": [ {{ \"digest\": \"{layer_digest}\" }} ] }}"
+    )
+    .into_bytes();
+    let digest = Digest::sha256_of(&manifest);
+    let content_type = [("content-type", MANIFEST_TYPE)];
+
+    let pushed = send_body(
+        &volume,
+        "PUT",
+        "/v2/team/app/manifests/v2",
+        &content_type,
+        manifest.clone(),
+    )
+    .await;
+    assert_eq!(pushed.status(), StatusCode::CREATED);
+    assert_eq!(
+        header(&pushed, "location"),
+        format!("/v2/team/app/manifests/{digest}")
+    );
+    assert_eq!(header(&pushed, "docker-content-digest"), digest.as_str());
+    let pulled = send(&volume, "GET", "/v2/team/app/manifests/v2", &[]).await;
+    assert_eq!(header(&pulled, "content-type"), MANIFEST_TYPE);
+    assert_eq!(body(pulled).await, manifest);
+
+    // By a digest the body does not hash to.
+    let wrong = Digest::sha256_of(b"another body");
+    let refused = send_body(
+        &volume,
+        "PUT",
+        &format!("/v2/team/app/manifests/{wrong}"),
+        &content_type,
+        manifest.clone(),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(refused).await, "DIGEST_INVALID");
+
+    // Into a repository that does not link the layer.
+    let refused = send_body(
+        &volume,
+        "PUT",
+        "/v2/other/app/manifests/v2",
+        &content_type,
+        manifest,
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value = serde_json::from_slice(&body(refused).await).expect("json");
+    assert_eq!(value["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+    assert_eq!(value["errors"][0]["detail"][0], layer_digest.as_str());
+
+    let garbage = send_body(
+        &volume,
+        "PUT",
+        "/v2/team/app/manifests/v3",
+        &content_type,
+        b"not a manifest".to_vec(),
+    )
+    .await;
+    assert_eq!(error_code(garbage).await, "MANIFEST_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manifest_with_a_subject_says_so_and_one_over_the_cap_is_413() {
+    let volume = volume();
+    let (_, subject, _) = seed(&volume.store);
+    let manifest =
+        format!(r#"{{"schemaVersion":2,"layers":[],"subject":{{"digest":"{subject}"}}}}"#)
+            .into_bytes();
+    let pushed = send_body(
+        &volume,
+        "PUT",
+        "/v2/team/app/manifests/sbom",
+        &[("content-type", MANIFEST_TYPE)],
+        manifest,
+    )
+    .await;
+    assert_eq!(pushed.status(), StatusCode::CREATED);
+    assert_eq!(header(&pushed, "oci-subject"), subject.as_str());
+
+    let huge = send_body(
+        &volume,
+        "PUT",
+        "/v2/team/app/manifests/huge",
+        &[("content-type", MANIFEST_TYPE)],
+        vec![b' '; (4 << 20) + 1],
+    )
+    .await;
+    assert_eq!(huge.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(error_code(huge).await, "MANIFEST_INVALID");
+}
+
 // ---- Through the binary ----------------------------------------------------
 
 mod served {
@@ -366,6 +682,18 @@ mod served {
 
     /// One HTTP/1.1 exchange, read until the server closes.
     pub fn request(port: u16, method: &str, path: &str, token: bool) -> Answer {
+        request_with(port, method, path, token, "application/octet-stream", &[])
+    }
+
+    /// As [`request`], with a body.
+    pub fn request_with(
+        port: u16,
+        method: &str,
+        path: &str,
+        token: bool,
+        content_type: &str,
+        body: &[u8],
+    ) -> Answer {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -377,9 +705,12 @@ mod served {
         };
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{authorization}Connection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{authorization}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
         )
         .expect("send");
+        // A server that refuses early may close before the body is through.
+        let _ = stream.write_all(body);
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).expect("read");
         let split = raw
@@ -508,6 +839,47 @@ mod served {
             Some("registry/2.0")
         );
         assert!(String::from_utf8_lossy(&error.body).contains("MANIFEST_UNKNOWN"));
+    }
+
+    #[test]
+    fn a_layer_larger_than_the_servers_body_limit_goes_in_and_the_limit_still_binds_the_rest() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let server = start(root.path(), true);
+        // One MiB over the server-wide limit of 32 MiB.
+        let layer = vec![7_u8; 33 << 20];
+
+        let opened = request_with(
+            server.port,
+            "POST",
+            "/v2/big/layer/blobs/uploads/",
+            false,
+            "",
+            &[],
+        );
+        assert_eq!(opened.status, 202, "{}", opened.head);
+        let location = header_of(&opened.head, "location")
+            .expect("location")
+            .to_owned();
+        let patched = request_with(
+            server.port,
+            "PATCH",
+            &location,
+            false,
+            "application/octet-stream",
+            &layer,
+        );
+        assert_eq!(patched.status, 202, "{}", patched.head);
+        assert_eq!(header_of(&patched.head, "range"), Some("0-34603007"));
+
+        let object = request_with(
+            server.port,
+            "POST",
+            "/api/v1/objects",
+            true,
+            "application/octet-stream",
+            &layer,
+        );
+        assert_eq!(object.status, 413, "{}", object.head);
     }
 
     #[test]

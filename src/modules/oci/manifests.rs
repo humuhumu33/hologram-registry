@@ -1,13 +1,18 @@
-//! Routes 4 and 5: a manifest by tag or by digest.
+//! Routes 4, 5 and 6: a manifest by tag or by digest, out and in.
 
-use super::error::{Context, OciError};
+use super::error::{Context, ErrorCode, OciError};
+use super::media;
 use super::respond::{not_modified, stamp_digest};
 use crate::oci_store::{OciStore, Reference, RepoName};
 use axum::body::Body;
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{HeaderName, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use std::sync::Arc;
+use tokio_stream::StreamExt;
+
+/// The largest manifest taken. The only body this module ever holds whole.
+const MANIFEST_MAX: usize = 4 * 1024 * 1024;
 
 /// Serve what is stored, under the media type it was pushed with.
 ///
@@ -48,4 +53,68 @@ pub async fn get(
         *response.body_mut() = Body::from(manifest.bytes);
     }
     Ok(response)
+}
+
+/// Route 6: store a manifest, byte for byte as it was sent.
+///
+/// # Errors
+///
+/// `MANIFEST_INVALID` (413 over 4 MiB); `DIGEST_INVALID` when the path names a
+/// digest the body does not hash to; `MANIFEST_BLOB_UNKNOWN` with the missing
+/// digests in `detail`.
+pub async fn put(
+    store: Arc<OciStore>,
+    repo: RepoName,
+    reference: Reference,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Response, OciError> {
+    let bytes = whole(body).await?;
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let (media_type, plan) = media::plan(content_type, &bytes)?;
+    let subject = plan.subject.as_ref().map(|plan| plan.subject.clone());
+    let target = repo.clone();
+    let digest = tokio::task::spawn_blocking(move || {
+        store.manifest_put(&target, &reference, &media_type, &bytes, &plan)
+    })
+    .await
+    .map_err(|error| OciError::internal(&error))?
+    .map_err(|error| OciError::from_store(error, Context::Manifest))?;
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::CREATED;
+    let out = response.headers_mut();
+    stamp_digest(out, &digest);
+    out.remove(axum::http::header::ETAG);
+    out.insert(
+        LOCATION,
+        HeaderValue::from_str(&format!("/v2/{repo}/manifests/{digest}"))
+            .map_err(|error| OciError::internal(&error))?,
+    );
+    if let Some(subject) = subject {
+        // Tells the client the referrers listing is kept here, so it need not
+        // maintain the fallback tag.
+        if let Ok(value) = HeaderValue::from_str(subject.as_str()) {
+            out.insert(HeaderName::from_static("oci-subject"), value);
+        }
+    }
+    out.insert(CONTENT_LENGTH, HeaderValue::from(0_u64));
+    Ok(response)
+}
+
+/// Read a manifest body, refusing it as soon as it passes the cap.
+async fn whole(body: Body) -> Result<Vec<u8>, OciError> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(piece) = stream.next().await {
+        let piece = piece.map_err(|_| OciError::new(ErrorCode::ManifestInvalid))?;
+        if bytes.len() + piece.len() > MANIFEST_MAX {
+            return Err(OciError::new(ErrorCode::ManifestInvalid)
+                .with_status(StatusCode::PAYLOAD_TOO_LARGE));
+        }
+        bytes.extend_from_slice(&piece);
+    }
+    Ok(bytes)
 }
