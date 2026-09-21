@@ -22,11 +22,12 @@ permissions:
 
 jobs:
   gate-a:
-    name: Gate A · OCI conformance (pull, push)
+    name: Gate A · OCI conformance (all four categories)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # Reported, not blocking, until both categories have been green once in
-    # CI. Then this line goes and they block (plan, P3 task 6 and P4 exit).
+    # Pull and push: 49 of 49 on 0a90892. Reported, not blocking, until all
+    # four categories have been green once in CI. Then this line goes and the
+    # suite blocks (plan, P7 task 6).
     # While it is here a red suite still shows a green run: read the summary.
     continue-on-error: true
     env:
@@ -62,6 +63,9 @@ jobs:
           enabled = ["dev.hologram.live.system", "dev.hologram.live.oci"]
           EOF
       - name: Start the server
+        env:
+          # The management category deletes; the reference's own switch turns it on.
+          REGISTRY_STORAGE_DELETE_ENABLED: "true"
         run: |
           ./target/debug/hologram --config "$RUNNER_TEMP/reg/config/live.toml" serve > "$RUNNER_TEMP/report/server.log" 2>&1 &
           for _ in $(seq 1 60); do
@@ -70,8 +74,8 @@ jobs:
           done
           cat "$RUNNER_TEMP/report/server.log"
           exit 1
-      - name: OCI conformance, pull and push categories
-        # The suite pushes what it then pulls, so nothing is seeded.
+      - name: OCI conformance, every category
+        # The suite pushes what it then reads, so nothing is seeded.
         run: |
           set -o pipefail
           docker run --rm --network host \
@@ -81,8 +85,8 @@ jobs:
             -e OCI_CROSSMOUNT_NAMESPACE=myorg/other \
             -e OCI_TEST_PULL=1 \
             -e OCI_TEST_PUSH=1 \
-            -e OCI_TEST_CONTENT_DISCOVERY=0 \
-            -e OCI_TEST_CONTENT_MANAGEMENT=0 \
+            -e OCI_TEST_CONTENT_DISCOVERY=1 \
+            -e OCI_TEST_CONTENT_MANAGEMENT=1 \
             -e OCI_HIDE_SKIPPED_WORKFLOWS=1 \
             -e OCI_REPORT_DIR=/report \
             "$CONFORMANCE_IMAGE" | tee "$RUNNER_TEMP/report/conformance.log"
@@ -90,7 +94,7 @@ jobs:
         if: always()
         run: |
           {
-            echo '### Gate A · OCI conformance (pull, push)'
+            echo '### Gate A · OCI conformance (all four categories)'
             echo '```'
             sed 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/report/conformance.log" | grep -E 'Ran [0-9]+ of|Passed|\[FAIL\]' || echo 'no verdict: the suite did not run'
             echo '```'

@@ -5,7 +5,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
-use hologram_live::modules::oci::handle;
+use hologram_live::modules::oci::{handle, Registry, Settings};
 use hologram_live::oci_store::{
     Digest, LinkKind, ManifestPlan, OciStore, OpenOptions, Reference, RepoName,
 };
@@ -70,12 +70,18 @@ fn seed(store: &OciStore) -> (Digest, Digest, Vec<u8>) {
 struct Volume {
     _dir: tempfile::TempDir,
     store: Arc<OciStore>,
+    /// `storage.delete.enabled`. Off, as in the reference, unless a test turns it on.
+    delete_enabled: bool,
 }
 
 fn volume() -> Volume {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(OciStore::open(dir.path(), options()).expect("open"));
-    Volume { _dir: dir, store }
+    Volume {
+        _dir: dir,
+        store,
+        delete_enabled: false,
+    }
 }
 
 async fn send(volume: &Volume, method: &str, path: &str, headers: &[(&str, &str)]) -> Response {
@@ -93,11 +99,13 @@ async fn send_body(
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
-    handle(
-        volume.store.clone(),
-        request.body(Body::from(body)).expect("request"),
-    )
-    .await
+    let registry = Registry {
+        store: volume.store.clone(),
+        settings: Settings {
+            delete_enabled: volume.delete_enabled,
+        },
+    };
+    handle(registry, request.body(Body::from(body)).expect("request")).await
 }
 
 fn header<'a>(response: &'a Response, name: &str) -> &'a str {
@@ -645,6 +653,227 @@ async fn a_manifest_with_a_subject_says_so_and_one_over_the_cap_is_413() {
     .await;
     assert_eq!(huge.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(error_code(huge).await, "MANIFEST_INVALID");
+}
+
+// ---- Discovery and management ------------------------------------------------
+
+async fn json_body(response: Response) -> serde_json::Value {
+    serde_json::from_slice(&body(response).await).expect("json")
+}
+
+/// Tag the seeded manifest again under each of `tags`.
+async fn tag_again(volume: &Volume, manifest: &[u8], tags: &[&str]) {
+    for tag in tags {
+        let pushed = send_body(
+            volume,
+            "PUT",
+            &format!("/v2/team/app/manifests/{tag}"),
+            &[("content-type", MANIFEST_TYPE)],
+            manifest.to_vec(),
+        )
+        .await;
+        assert_eq!(pushed.status(), StatusCode::CREATED, "{tag}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tags_are_listed_in_byte_order_and_paged_with_a_link() {
+    let volume = volume();
+    let (_, _, manifest) = seed(&volume.store);
+    tag_again(&volume, &manifest, &["v10", "v2", "alpha"]).await;
+
+    let all = send(&volume, "GET", "/v2/team/app/tags/list", &[]).await;
+    assert_eq!(all.status(), StatusCode::OK);
+    assert!(all.headers().get("link").is_none());
+    let value = json_body(all).await;
+    assert_eq!(value["name"], "team/app");
+    assert_eq!(
+        value["tags"],
+        serde_json::json!(["alpha", "v1", "v10", "v2"]),
+        "v10 sorts before v2"
+    );
+
+    let first = send(&volume, "GET", "/v2/team/app/tags/list?n=2", &[]).await;
+    assert_eq!(
+        header(&first, "link"),
+        "</v2/team/app/tags/list?last=v1&n=2>; rel=\"next\""
+    );
+    assert_eq!(
+        json_body(first).await["tags"],
+        serde_json::json!(["alpha", "v1"])
+    );
+    let second = send(&volume, "GET", "/v2/team/app/tags/list?last=v1&n=2", &[]).await;
+    assert!(
+        second.headers().get("link").is_none(),
+        "the last page has no next"
+    );
+    assert_eq!(
+        json_body(second).await["tags"],
+        serde_json::json!(["v10", "v2"])
+    );
+
+    let unknown = send(&volume, "GET", "/v2/never/seen/tags/list", &[]).await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(unknown).await, "NAME_UNKNOWN");
+    let bad = send(&volume, "GET", "/v2/team/app/tags/list?n=many", &[]).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(bad).await, "PAGINATION_NUMBER_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_catalogue_lists_repositories_and_pages() {
+    let volume = volume();
+    seed(&volume.store);
+    push_blob(&volume.store, "alpha/one", b"one");
+    push_blob(&volume.store, "zeta/last", b"two");
+    let all = send(&volume, "GET", "/v2/_catalog", &[]).await;
+    assert_eq!(
+        json_body(all).await["repositories"],
+        serde_json::json!(["alpha/one", "team/app", "zeta/last"])
+    );
+    let first = send(&volume, "GET", "/v2/_catalog?n=1", &[]).await;
+    assert_eq!(
+        header(&first, "link"),
+        "</v2/_catalog?last=alpha/one&n=1>; rel=\"next\""
+    );
+    let rest = send(&volume, "GET", "/v2/_catalog?last=alpha%2Fone", &[]).await;
+    assert_eq!(
+        json_body(rest).await["repositories"],
+        serde_json::json!(["team/app", "zeta/last"])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn referrers_are_an_index_filtered_by_artifact_type_and_never_404() {
+    let volume = volume();
+    let (_, subject, _) = seed(&volume.store);
+    for (tag, artifact_type) in [
+        ("sbom", "application/vnd.example.sbom"),
+        ("sig", "application/vnd.example.sig"),
+    ] {
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"artifactType":"{artifact_type}","layers":[],"subject":{{"digest":"{subject}"}},"annotations":{{"made.by":"{tag}"}}}}"#
+        );
+        let pushed = send_body(
+            &volume,
+            "PUT",
+            &format!("/v2/team/app/manifests/{tag}"),
+            &[("content-type", MANIFEST_TYPE)],
+            manifest.into_bytes(),
+        )
+        .await;
+        assert_eq!(pushed.status(), StatusCode::CREATED);
+    }
+    let path = format!("/v2/team/app/referrers/{subject}");
+    let all = send(&volume, "GET", &path, &[]).await;
+    assert_eq!(all.status(), StatusCode::OK);
+    assert_eq!(
+        header(&all, "content-type"),
+        "application/vnd.oci.image.index.v1+json"
+    );
+    assert!(all.headers().get("oci-filters-applied").is_none());
+    let value = json_body(all).await;
+    assert_eq!(value["schemaVersion"], 2);
+    assert_eq!(value["manifests"].as_array().expect("manifests").len(), 2);
+
+    let filtered = send(
+        &volume,
+        "GET",
+        &format!("{path}?artifactType=application%2Fvnd.example.sbom"),
+        &[],
+    )
+    .await;
+    assert_eq!(header(&filtered, "oci-filters-applied"), "artifactType");
+    let value = json_body(filtered).await;
+    let manifests = value["manifests"].as_array().expect("manifests");
+    assert_eq!(manifests.len(), 1);
+    assert_eq!(manifests[0]["artifactType"], "application/vnd.example.sbom");
+    assert_eq!(manifests[0]["mediaType"], MANIFEST_TYPE);
+    assert_eq!(manifests[0]["annotations"]["made.by"], "sbom");
+    assert!(manifests[0]["size"].as_u64().expect("size") > 0);
+
+    let nothing = Digest::sha256_of(b"no one refers to this");
+    let empty = send(
+        &volume,
+        "GET",
+        &format!("/v2/team/app/referrers/{nothing}"),
+        &[],
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(json_body(empty).await["manifests"], serde_json::json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_is_off_until_it_is_turned_on() {
+    let volume = volume();
+    let (layer_digest, digest, _) = seed(&volume.store);
+    for path in [
+        format!("/v2/team/app/manifests/{digest}"),
+        format!("/v2/team/app/blobs/{layer_digest}"),
+    ] {
+        let refused = send(&volume, "DELETE", &path, &[]).await;
+        assert_eq!(refused.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
+        assert_eq!(error_code(refused).await, "UNSUPPORTED");
+        let still = send(&volume, "HEAD", &path, &[]).await;
+        assert_eq!(still.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_removes_links_in_one_repository_and_leaves_the_other_pulling() {
+    let mut volume = volume();
+    volume.delete_enabled = true;
+    let (layer_digest, digest, manifest) = seed(&volume.store);
+    tag_again(&volume, &manifest, &["keep", "drop"]).await;
+    // A second repository shares the layer.
+    let mounted = send(
+        &volume,
+        "POST",
+        &format!("/v2/other/app/blobs/uploads/?mount={layer_digest}&from=team%2Fapp"),
+        &[],
+    )
+    .await;
+    assert_eq!(mounted.status(), StatusCode::CREATED);
+
+    // A tag goes alone; the manifest stays.
+    let dropped = send(&volume, "DELETE", "/v2/team/app/manifests/drop", &[]).await;
+    assert_eq!(dropped.status(), StatusCode::ACCEPTED);
+    let manifest_path = format!("/v2/team/app/manifests/{digest}");
+    let by_digest = send(&volume, "HEAD", &manifest_path, &[]).await;
+    assert_eq!(by_digest.status(), StatusCode::OK);
+
+    // By digest: the manifest and every tag on it.
+    let deleted = send(&volume, "DELETE", &manifest_path, &[]).await;
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+    for reference in ["keep", "v1", digest.as_str()] {
+        let path = format!("/v2/team/app/manifests/{reference}");
+        let gone = send(&volume, "GET", &path, &[]).await;
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND, "{reference}");
+    }
+    let again = send(&volume, "DELETE", &manifest_path, &[]).await;
+    assert_eq!(error_code(again).await, "MANIFEST_UNKNOWN");
+
+    let blob_path = format!("/v2/team/app/blobs/{layer_digest}");
+    let deleted = send(&volume, "DELETE", &blob_path, &[]).await;
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+    let gone = send(&volume, "HEAD", &blob_path, &[]).await;
+    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    let again = send(&volume, "DELETE", &blob_path, &[]).await;
+    assert_eq!(error_code(again).await, "BLOB_UNKNOWN");
+    let shared = send(
+        &volume,
+        "GET",
+        &format!("/v2/other/app/blobs/{layer_digest}"),
+        &[],
+    )
+    .await;
+    assert_eq!(shared.status(), StatusCode::OK);
+    assert_eq!(
+        body(shared).await,
+        layer(),
+        "the other repository still pulls"
+    );
 }
 
 // ---- Through the binary ----------------------------------------------------

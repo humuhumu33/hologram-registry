@@ -9,7 +9,9 @@
 
 mod blobs;
 mod body;
+mod delete;
 pub mod error;
+mod listing;
 mod manifests;
 mod media;
 pub mod path;
@@ -42,6 +44,32 @@ static DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     // The registry API is HTTP only: it adds no operation to the RPC surface.
     operations: &[],
 };
+
+/// What the registry serves from, and how it is set to behave.
+#[derive(Clone)]
+pub struct Registry {
+    pub store: Arc<OciStore>,
+    pub settings: Settings,
+}
+
+/// The reference's settings that change what a route answers. P5 reads them
+/// from `config.yml` too; the environment names are the reference's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// `storage.delete.enabled`. Off by default, as in the reference.
+    pub delete_enabled: bool,
+}
+
+impl Settings {
+    pub fn from_environment() -> Self {
+        let on = |name: &str| {
+            std::env::var(name).is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"))
+        };
+        Self {
+            delete_enabled: on("REGISTRY_STORAGE_DELETE_ENABLED"),
+        }
+    }
+}
 
 pub struct OciRegistryModule;
 
@@ -91,15 +119,22 @@ async fn without_the_slash() -> Response {
 
 async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     match state.oci_store() {
-        Some(store) => handle(store.clone(), request).await,
+        Some(store) => {
+            static SETTINGS: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
+            let registry = Registry {
+                store: store.clone(),
+                settings: *SETTINGS.get_or_init(Settings::from_environment),
+            };
+            handle(registry, request).await
+        }
         // The volume is opened whenever the module is enabled, so this is a
         // defect, not a state a client can cause.
         None => OciError::internal(&"the registry module is enabled without a volume").into_response(),
     }
 }
 
-/// Answer one request under `/v2/` from `store`.
-pub async fn handle(store: Arc<OciStore>, request: Request) -> Response {
+/// Answer one request under `/v2/`.
+pub async fn handle(registry: Registry, request: Request) -> Response {
     // The body is not `Sync`, so nothing borrowed from the whole request may
     // live across an await: the head is borrowed, the body is moved.
     let (head, body) = request.into_parts();
@@ -108,7 +143,7 @@ pub async fn handle(store: Arc<OciStore>, request: Request) -> Response {
         .ok_or_else(OciError::unknown_route)
         .and_then(|rest| path::parse(&head.method, &rest));
     match route {
-        Ok(route) => serve(store, route, &head, body)
+        Ok(route) => serve(registry, route, &head, body)
             .await
             .unwrap_or_else(IntoResponse::into_response),
         Err(error) => error.into_response(),
@@ -116,12 +151,13 @@ pub async fn handle(store: Arc<OciStore>, request: Request) -> Response {
 }
 
 async fn serve(
-    store: Arc<OciStore>,
+    registry: Registry,
     route: Route,
     head: &axum::http::request::Parts,
     body: Body,
 ) -> Result<Response, OciError> {
     let (headers, query) = (&head.headers, head.uri.query());
+    let Registry { store, settings } = registry;
     match route {
         Route::Base => Ok(json(StatusCode::OK, "{}")),
         Route::Options { allow } => {
@@ -153,13 +189,17 @@ async fn serve(
             UploadVerb::Put => uploads::put(store, repo, id, query, body).await,
             UploadVerb::Delete => uploads::cancel(store, repo, id).await,
         },
-        // Delete, listing and referrers arrive with the phase that builds
-        // them (P7). Until then the path is known and refused.
-        Route::Catalog
-        | Route::TagsList { .. }
-        | Route::Manifest { .. }
-        | Route::Blob { .. }
-        | Route::Referrers { .. } => Err(OciError::new(ErrorCode::Unsupported)),
+        Route::Catalog => listing::catalog(store, query).await,
+        Route::TagsList { repo } => listing::tags(store, repo, query).await,
+        Route::Referrers { repo, digest } => listing::referrers(store, repo, digest, query).await,
+        // Off unless `storage.delete.enabled`, as in the reference.
+        Route::Manifest { .. } | Route::Blob { .. } if !settings.delete_enabled => {
+            Err(OciError::new(ErrorCode::Unsupported))
+        }
+        Route::Manifest {
+            repo, reference, ..
+        } => delete::manifest(store, repo, reference).await,
+        Route::Blob { repo, digest, .. } => delete::blob(store, repo, digest).await,
     }
 }
 
