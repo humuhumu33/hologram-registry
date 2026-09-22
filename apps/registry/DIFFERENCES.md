@@ -73,7 +73,6 @@ that field, so a change to the status or anything else still fails.
 | D-005 | 03-names | name-15 | * | * | * | the reference answers 500 for a name over 255 characters; we answer the plain 404 |
 | D-006 | 03-names | name-16 | * | * | * | the reference answers 500 for a name over 255 characters; we answer the plain 404 |
 | D-007 | 04-errors-read | digest-invalid-manifest | * | * | * | the reference answers 500 for a malformed digest in a manifest path; we answer 400 DIGEST_INVALID |
-| D-008 | 05-blob-read | range-two | * | * | * | several ranges are answered with the whole blob; the reference sends multipart/byteranges |
 | D-009 | 07-push-monolithic | post-with-digest | * | * | * | a monolithic upload finishes in one request (201); the reference opens a session (202) |
 | D-010 | 07-push-monolithic | head-after-post | * | * | * | follows from D-009: the blob exists after the one request |
 | D-011 | 09-digest-mismatch | session-after | * | * | * | an upload whose bytes do not match its digest is discarded; the reference keeps the session |
