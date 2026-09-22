@@ -13,13 +13,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Red gate, no release (FR-017). Every other job waits on this one.
+  gates:
+    name: Every registry gate green on this commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: gates.yml and registry-os.yml green on the tagged commit; the nightly too, from 1.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) apps/registry/gates/release/check-gates.sh "$GITHUB_SHA" ;;
+            *) apps/registry/gates/release/check-gates.sh "$GITHUB_SHA" --nightly ;;
+          esac
+
   rootfs-reproducibility:
+    needs: gates
     uses: ./.github/workflows/rootfs-reproducibility.yml
 
   component-reproducibility:
+    needs: gates
     uses: ./.github/workflows/component-reproducibility.yml
 
   verify:
+    needs: gates
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -61,8 +83,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
-      - name: Build standalone server
-        run: cargo build --release --locked --package hologram-live --bin hologram --target ${{ matrix.target }}
+      # The registry is the product this tag ships (FR-016): feature `oci`.
+      - name: Build standalone server, with the registry
+        run: cargo build --release --locked --package hologram-live --bin hologram --features oci --target ${{ matrix.target }}
+      - name: The binary is the registry
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/hologram"
+          [ -f "$bin" ] || bin="$bin.exe"
+          "$bin" oci --help > /dev/null
+          ext=""; case "$bin" in *.exe) ext=".exe" ;; esac
+          cp "$bin" "$RUNNER_TEMP/registry$ext"
+          version=$("$RUNNER_TEMP/registry$ext" --version)
+          echo "$version"
+          case "$version" in registry\ *) ;; *) exit 1 ;; esac
       - name: Package Unix binary
         if: matrix.archive == 'tar'
         shell: bash
@@ -104,5 +138,5 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --title "Hologram Server $version" --generate-notes
+            gh release create "$GITHUB_REF_NAME" dist/* --title "Hologram Registry $version" --generate-notes
           fi

@@ -58,7 +58,9 @@ release binaries build with `--features oci`.
 
 ## How equivalence is proven
 
-Eight gates, in CI. A release is refused unless all are green. A to E prove that it is the same registry:
+Eight gates. A tag publishes nothing unless the gates in CI today (A, B, C, the image and the three-system
+suite) are green on the tagged commit, and, from 1.0.0, the latest nightly too
+(`gates/release/check-gates.sh`, first job of the release). A to E prove that it is the same registry:
 
 | Gate | Proves |
 |---|---|
