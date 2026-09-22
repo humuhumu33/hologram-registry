@@ -1,29 +1,46 @@
 name: gates
 
 # Hologram Registry's equivalence gates. Each job judges the real binary from
-# outside, with a tool we did not write. Path-filtered like registry-os.
+# outside, with a tool we did not write. They run on every pull request and
+# in the merge queue, skipping when no registry path changed
+# (apps/registry/gates/release/registry-changed.sh), and in full on main.
 on:
   push:
-    branches: ["registry/**"]
+    branches: [main, "registry/**"]
   pull_request:
-    paths:
-      - "src/oci_store/**"
-      - "src/modules/oci/**"
-      - "src/registry_compat/**"
-      - "apps/registry/**"
-      - "third_party/kappa/**"
-      - "third_party/dcbor/**"
-      - "scripts/check-kappa-pin.sh"
-      - "tests/oci_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/gates.yml"
+  merge_group:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Registry touched?
+    runs-on: ubuntu-24.04
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$EVENT" in
+            pull_request) run=$(apps/registry/gates/release/registry-changed.sh "$PR_BASE" HEAD) ;;
+            merge_group) run=$(apps/registry/gates/release/registry-changed.sh "$MQ_BASE" HEAD) ;;
+            *) run=true ;;
+          esac
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "Registry touched: $run ($EVENT)" >> "$GITHUB_STEP_SUMMARY"
+
   gate-a:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: Gate A · OCI conformance (all four categories)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -106,6 +123,8 @@ jobs:
           if-no-files-found: warn
 
   gate-b:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: Gate B · same session, reference and us
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -157,6 +176,8 @@ jobs:
           if-no-files-found: warn
 
   gate-c:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: Gate C · unchanged clients (docker, skopeo)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -239,6 +260,8 @@ jobs:
         run: tail -n 80 "$RUNNER_TEMP/server.log" "$RUNNER_TEMP/login.log"
 
   image:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     name: Image · the registry image, from outside (P5 T4)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -265,3 +288,22 @@ jobs:
       - name: The image's size
         if: always()
         run: docker image ls hologram-registry:ci --format '{{.Size}}'
+
+  verdict:
+    # The one check branch protection requires. Green when no registry path
+    # changed; otherwise green only when every job above passed.
+    name: Gates · verdict
+    if: always()
+    needs: [changes, gate-a, gate-b, gate-c, image]
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          RUN: ${{ needs.changes.outputs.run }}
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "changes=$CHANGES run=$RUN results: $RESULTS"
+          [ "$CHANGES" = success ] || exit 1
+          if [ "$RUN" = true ]; then
+            for r in $RESULTS; do [ "$r" = success ] || exit 1; done
+          fi
