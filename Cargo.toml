@@ -1,6 +1,6 @@
 [package]
 name = "hologram-live"
-version = "1.0.0"
+version = "0.0.2-dryrun"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
