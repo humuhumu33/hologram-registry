@@ -18,8 +18,9 @@ const MANIFEST_MAX: usize = 4 * 1024 * 1024;
 ///
 /// A tag is resolved to a digest once, inside the store, and that digest is
 /// what is read: the answer is one whole manifest, the old or the new, never a
-/// mix, however the tag moves meanwhile. What `Accept` changes is gate B
-/// scenario `manifest-accept`; until it is recorded, `Accept` changes nothing.
+/// mix, however the tag moves meanwhile. What `Accept` changes was to be
+/// recorded by a gate B scenario `manifest-accept`, which is planned and not
+/// written; until it is, `Accept` changes nothing here.
 ///
 /// # Errors
 ///

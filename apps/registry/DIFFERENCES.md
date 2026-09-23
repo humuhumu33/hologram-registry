@@ -63,6 +63,12 @@ need because its index is local; `validation.disabled: true`, which is what this
 fetches a foreign layer; and `compatibility.schema1`, because schema 1 manifests are refused whatever it says.
 `validation.disabled: false` is refused by name, because the check it asks for is not built.
 
+**A browser on another origin.** `http.headers` sends the CORS headers the reference sends, but a registry with a
+login refuses the preflight: the reference authorizes every request, `OPTIONS` included, and a browser sends no
+credentials with a preflight. So a web UI on another origin works against a registry with no login, and otherwise
+needs a proxy that holds the credentials. This registry does not deviate here; a page served from the registry's own
+origin needs no preflight at all.
+
 **Tokens.** `auth.token` validates bearer tokens as the reference does, from `realm`, `service`, `issuer` and a
 `jwks` key set; `rootcertbundle` is refused by name, with `jwks` named as the way to say the same thing. Where the
 reference stops there and expects a separate token server, `auth.token.local` makes this registry its own:

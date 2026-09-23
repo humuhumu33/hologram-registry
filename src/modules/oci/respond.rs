@@ -55,8 +55,9 @@ pub enum ByteRange {
 ///
 /// One range is served. More than one is answered with the whole body, which
 /// the HTTP specification allows; the reference sends `multipart/byteranges`,
-/// which no registry client asks for. Gate B scenario `blob-range-forms`
-/// records the difference.
+/// which no registry client asks for. A gate B scenario `blob-range-forms`
+/// to record the difference is planned and not written; the difference itself
+/// is in DIFFERENCES.md.
 pub fn byte_range(header: Option<&HeaderValue>, size: u64) -> ByteRange {
     let Some(header) = header else {
         return ByteRange::Whole;

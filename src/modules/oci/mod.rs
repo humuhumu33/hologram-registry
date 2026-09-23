@@ -285,10 +285,11 @@ pub struct Settings {
     /// `storage.delete.enabled`. Off by default, as in the reference.
     pub delete_enabled: bool,
     /// `http.headers`: added to every answer under `/v2/`, errors and
-    /// preflights included. It is the reference's recipe for CORS, which a web
-    /// UI on another origin needs (FR-R31): `Access-Control-Allow-Origin`,
-    /// `-Methods`, `-Headers`, and `-Expose-Headers` naming
-    /// `Docker-Content-Digest` and `Link`. P5 fills it from `config.yml`.
+    /// preflights included. It is the reference's recipe for CORS
+    /// (FR-R31): `Access-Control-Allow-Origin`, `-Methods`, `-Headers`, and
+    /// `-Expose-Headers` naming `Docker-Content-Digest` and `Link`. It reaches
+    /// a browser on another origin only where no login is configured: with
+    /// one, the preflight is refused, as the reference refuses it.
     pub headers: Vec<(axum::http::HeaderName, HeaderValue)>,
     /// `storage.maintenance.readonly.enabled`: writes answer 405, as the
     /// reference's handlers leave their write methods unregistered.
@@ -520,9 +521,12 @@ pub async fn handle(registry: Registry, request: Request) -> Response {
     }
     absolute_location(&mut response, origin.as_deref());
     in_flight.done(response.status().as_u16());
-    // Last, so they are on errors and on `OPTIONS` too. A browser's preflight
-    // carries no credentials: when login lands (P6) `OPTIONS` stays in front
-    // of it, or no web UI on another origin can reach the registry.
+    // Last, so they are on errors and on `OPTIONS` too. With a login
+    // configured a preflight is refused, because the reference authorizes
+    // every request including `OPTIONS` (`app.go`, `dispatcher` calls
+    // `authorized` with no exemption) and a browser sends no credentials with
+    // one. A web UI on another origin therefore needs a registry with no
+    // login, or a proxy in front (errata E17, DIFFERENCES.md).
     for (name, value) in configured {
         response.headers_mut().append(name, value);
     }

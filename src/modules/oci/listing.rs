@@ -1,8 +1,10 @@
 //! Routes 2, 3 and R: the catalogue, a repository's tags, a manifest's referrers.
 //!
 //! Paging edge cases (`n=0`, an `n` over the limit, a `last` that does not
-//! exist) are recalled from the reference and the OCI text. Gate B scenarios
-//! `tags-paging`, `catalog-paging` and `referrers-present` record them.
+//! exist) are recalled from the reference and the OCI text, and held by gate A
+//! and the tests here. No gate B scenario compares them with the reference
+//! yet: `tags-paging`, `catalog-paging` and `referrers-present` are planned,
+//! not written, so this is recall, not measurement.
 
 use super::error::{Context, ErrorCode, OciError};
 use super::media::OCI_INDEX;
